@@ -2,7 +2,7 @@
 --
 -- Applies ONLY to a validator database created before scheduled secret pruning
 -- was introduced, i.e. one whose `keygen_secrets` and `nonces_chunks` tables
--- have no `delete_after` column and which has no `group_secret_reconciliation`
+-- have no `delete_at_block` column and which has no `group_secret_reconciliation`
 -- table. It exists for the long-running dev network, whose database predates
 -- the change and holds secrets worth keeping. A recreated database already gets
 -- the new schema from `SecretStore::new`
@@ -13,7 +13,7 @@
 --
 --     sqlite3 <validator-database> \
 --         "SELECT COUNT(*) FROM pragma_table_info('keygen_secrets')
---          WHERE name = 'delete_after';"
+--          WHERE name = 'delete_at_block';"
 --
 -- 1 means it has, 0 means it has not. SQLite has no
 -- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so applying this twice cannot be
@@ -25,7 +25,7 @@
 --
 --     sqlite3 <validator-database> < migrations/2026_09_08_scheduled_secret_pruning.sql
 --
--- Existing secret rows are preserved, their deletion deadlines start as NULL
+-- Existing secret rows are preserved, their deletion blocks start as NULL
 -- (nothing scheduled for deletion), and the reconciliation marker starts empty
 -- (no reconciliation accepted yet), so the updated validator schedules and
 -- collects from its next accepted reconciliation onwards.
@@ -34,8 +34,8 @@
 
 BEGIN;
 
-ALTER TABLE keygen_secrets ADD COLUMN delete_after INTEGER;
-ALTER TABLE nonces_chunks ADD COLUMN delete_after INTEGER;
+ALTER TABLE keygen_secrets ADD COLUMN delete_at_block INTEGER;
+ALTER TABLE nonces_chunks ADD COLUMN delete_at_block INTEGER;
 
 CREATE TABLE IF NOT EXISTS group_secret_reconciliation (
     id    INTEGER PRIMARY KEY CHECK (id = 0),
