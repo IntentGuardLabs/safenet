@@ -63,18 +63,26 @@ pub struct SecretStore {
 impl SecretStore {
     /// Creates the store backed by `pool`, creating its tables if absent.
     pub async fn new(pool: SqlitePool) -> Result<Self, Error> {
+        // Both secret tables carry a nullable `delete_after` deadline: the
+        // block number from which the row may be deleted, `NULL` meaning no
+        // pending deletion. `group_secret_reconciliation` holds the block of
+        // the last accepted reconciliation as a single row, an empty table
+        // meaning none has been accepted yet. Every deadline here is a block
+        // number, never a timestamp.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS keygen_secrets (
-                 group_id TEXT NOT NULL,
-                 address  TEXT NOT NULL,
-                 secrets  TEXT NOT NULL,
+                 group_id     TEXT NOT NULL,
+                 address      TEXT NOT NULL,
+                 secrets      TEXT NOT NULL,
+                 delete_after INTEGER,
                  PRIMARY KEY (group_id, address)
              );
 
              CREATE TABLE IF NOT EXISTS nonces_chunks (
-                 root     TEXT NOT NULL,
-                 group_id TEXT NOT NULL,
-                 address  TEXT NOT NULL,
+                 root         TEXT NOT NULL,
+                 group_id     TEXT NOT NULL,
+                 address      TEXT NOT NULL,
+                 delete_after INTEGER,
                  PRIMARY KEY (root)
              );
 
@@ -84,6 +92,11 @@ impl SecretStore {
                  nonce TEXT    NOT NULL,
                  PRIMARY KEY (root, offs),
                  FOREIGN KEY (root) REFERENCES nonces_chunks (root) ON DELETE CASCADE
+             );
+
+             CREATE TABLE IF NOT EXISTS group_secret_reconciliation (
+                 id    INTEGER PRIMARY KEY CHECK (id = 0),
+                 block INTEGER NOT NULL
              );
 
              CREATE INDEX IF NOT EXISTS idx_nonces_chunks_group
@@ -443,5 +456,29 @@ mod tests {
                 .is_none()
         );
         assert_eq!(count_root_nonces(&store, root).await, 2);
+    }
+
+    #[tokio::test]
+    async fn reopening_preserves_stored_secrets() {
+        let store = store().await;
+        store
+            .store_keygen_secrets(GROUP, ME, keygen_secrets())
+            .await
+            .unwrap();
+        let root = store
+            .register_nonces_chunk(GROUP, ME, nonce_chunk(3))
+            .await
+            .unwrap();
+        assert!(store.take_nonce(root, 0).await.unwrap().is_some());
+
+        // Creating the store again re-runs the schema setup exactly as a
+        // restart does, so the added table and columns must leave the secrets
+        // already in the database untouched.
+        let store = SecretStore::new(store.pool.clone()).await.unwrap();
+
+        assert!(get_keygen_secrets(&store, GROUP).await.is_some());
+        assert_eq!(count_root_nonces(&store, root).await, 2);
+        // A consumed nonce is never restored.
+        assert!(store.nonces_reveal(root, 0).await.unwrap().is_none());
     }
 }
