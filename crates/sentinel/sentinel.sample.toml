@@ -9,22 +9,33 @@
 # The chain RPC endpoint.
 rpc = "https://rpc.gnosischain.com"
 
-# The secp256k1 private key used to sign onchain transactions (bond
-# commitments and votes) and reveal them onchain. Fund this account with
-# just enough gas to submit those transactions — see the sentinel
-# handbook's "Secrets" section for the risks of reusing this key.
-signer = "0x0000000000000000000000000000000000000000000000000000000000000001"
-
 # A SQLite connection string for the sentinel's persistent state (request
 # tracking, indexer/transaction-queue progress). Must be backed up and
-# restored across restarts.
-database = "sqlite:/var/lib/safenet/sentinel/data/storage.db"
+# restored across restarts. `mode=rwc` lets the sentinel create the file on
+# first start (it otherwise fails with "unable to open database file"). The
+# directory must be writable by the container user (65532).
+database = "sqlite:/var/lib/safenet/sentinel/data/storage.db?mode=rwc"
 
 # The `SentinelOracle` contract watched and voted/committed on.
 oracle = "0x0000000000000000000000000000000000000000"
 
 # The `Consensus` contract whose proposals are hashed into request ids.
 consensus = "0x0000000000000000000000000000000000000000"
+
+# The account used to sign onchain transactions (bond commitments and votes)
+# and reveal them onchain, loaded from a Web3 Secret Storage v3 (Geth
+# compatible) encrypted JSON keystore. The configuration only references
+# secret files; it never contains key material. See the sentinel handbook's
+# "Secrets" section for how to create the keystore and provision the password.
+# Fund this account with just enough gas and fee token for its onchain work.
+[signer]
+type = "keystore"
+# Relative paths are resolved against the directory of this file.
+path = "/run/secrets/sentinel-keystore.json"
+# The keystore password, read verbatim: NO trailing newline (`printf '%s'`).
+password_file = "/run/secrets/sentinel-keystore-password"
+# Mandatory. Startup fails unless the keystore decrypts to exactly this address.
+expected_address = "0x0000000000000000000000000000000000000001"
 
 [sentinel]
 # The ERC-20 fee token approved for bonds.

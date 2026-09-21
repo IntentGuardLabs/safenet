@@ -72,6 +72,13 @@ pub struct Config {
     /// resuming, this back-fills history via a warp without emitting a (fake)
     /// reorg.
     pub start_block: Option<u64>,
+    /// Strict sequential mode (set by services that opt in, not by TOML):
+    /// catch-up processes every block one at a time from the persisted cursor
+    /// or `start_block` instead of warping over ranges, a fresh database
+    /// requires `start_block`, and `start_block` is validated against the chain
+    /// head and the persisted cursor.
+    #[serde(skip)]
+    pub strict: bool,
 }
 
 impl Default for Config {
@@ -82,6 +89,7 @@ impl Default for Config {
             block_retry_delays: vec![200, 100, 100],
             max_reorg_depth: 5,
             start_block: None,
+            strict: false,
         }
     }
 }
@@ -128,6 +136,24 @@ pub enum Error {
     /// inconsistent RPC node.
     #[error("block {0} is unexpectedly missing")]
     MissingBlock(BlockId),
+    /// A fresh database needs `[index].start_block`: starting at the current
+    /// head would silently skip history.
+    #[error(
+        "no persisted cursor and `[index].start_block` is not set; set it to the earliest deployment block of the watched contracts"
+    )]
+    MissingStartBlock,
+    /// `start_block` is above the chain head.
+    #[error("`[index].start_block` {start} is above the chain head {head}")]
+    StartBlockAboveHead { start: u64, head: u64 },
+    /// `start_block` is beyond the persisted cursor, which would skip blocks.
+    #[error(
+        "`[index].start_block` {start} is beyond the persisted cursor {cursor}; it changed unexpectedly"
+    )]
+    StartBlockAheadOfCursor { start: u64, cursor: u64 },
+    /// An endpoint served a block whose hash or parent hash is inconsistent
+    /// with the chain already established at a final height.
+    #[error("block {number} is inconsistent with the established chain")]
+    InconsistentChain { number: u64 },
     /// A reorg unwound every block being tracked for reorg detection without
     /// finding a common ancestor, meaning it went deeper than the configured
     /// `max_reorg_depth` and a block already assumed final was replaced. The
@@ -173,6 +199,18 @@ struct SafeBlock {
     hash: B256,
 }
 
+/// Sequential catch-up over final blocks `next..=to`, one block at a time.
+#[derive(Clone, Copy, Debug)]
+struct Backfill {
+    next: u64,
+    to: u64,
+    /// The hash of the previously emitted backfill block.
+    prev: Option<B256>,
+}
+
+/// Refresh the observed chain head every this many backfilled blocks.
+const BACKFILL_HEAD_REFRESH: u64 = 64;
+
 /// Watches the chain head, producing [`BlockUpdate`]s and detecting reorgs.
 pub struct BlockWatcher {
     provider: Provider,
@@ -188,6 +226,9 @@ pub struct BlockWatcher {
     /// reorg detection. Ordered oldest-first.
     recent: VecDeque<BlockHeader>,
     queue: VecDeque<BlockUpdate>,
+    /// Pending sequential catch-up (strict mode), emitted after any leading
+    /// uncle and before the `recent` blocks in `queue`.
+    backfill: Option<Backfill>,
 }
 
 impl BlockWatcher {
@@ -218,6 +259,7 @@ impl BlockWatcher {
             },
             recent: VecDeque::new(),
             queue: VecDeque::new(),
+            backfill: None,
         };
         watcher.initialize(indexed).await?;
         Ok(watcher)
@@ -236,14 +278,50 @@ impl BlockWatcher {
     }
 
     /// Fetches a block that is expected to exist, erroring if the node does not
-    /// have it.
+    /// have it. The endpoint is charged with a failure: it is expected to serve
+    /// every block at or below the head.
     async fn require_block(&self, id: BlockId) -> Result<BlockHeader, Error> {
-        self.get_block(id).await?.ok_or(Error::MissingBlock(id))
+        match self.get_block(id).await? {
+            Some(block) => Ok(block),
+            None => {
+                if let Some(pool) = self.provider.pool() {
+                    pool.report_failure(crate::rpc::Reason::MissingBlock);
+                }
+                Err(Error::MissingBlock(id))
+            }
+        }
+    }
+
+    /// Records `block` as the head last seen from the active endpoint.
+    fn observe_head(&self, block: &BlockHeader) {
+        if let Some(pool) = self.provider.pool() {
+            pool.observe_head(block.number, block.hash);
+        }
+        metrics::rpc_head_block().set(block.number as f64);
     }
 
     async fn initialize(&mut self, indexed: Option<BlockStatus>) -> Result<(), Error> {
         let latest = self.require_block(BlockId::latest()).await?;
+        self.observe_head(&latest);
         let safe = latest.number.saturating_sub(self.config.max_reorg_depth);
+        if self.config.strict {
+            match (indexed, self.config.start_block) {
+                (None, None) => return Err(Error::MissingStartBlock),
+                (None, Some(start)) if start > latest.number => {
+                    return Err(Error::StartBlockAboveHead {
+                        start,
+                        head: latest.number,
+                    });
+                }
+                (Some(indexed), Some(start)) if start > indexed.latest.saturating_add(1) => {
+                    return Err(Error::StartBlockAheadOfCursor {
+                        start,
+                        cursor: indexed.latest,
+                    });
+                }
+                _ => {}
+            }
+        }
         tracing::debug!(
             latest = latest.number,
             safe,
@@ -271,10 +349,7 @@ impl BlockWatcher {
             if let Some(uncle) = uncle
                 && uncle <= safe
             {
-                self.queue.push_back(BlockUpdate::Warp {
-                    from: uncle,
-                    to: safe,
-                });
+                self.catch_up(uncle, safe);
             }
         } else if let Some(start_block) = self.config.start_block
             && start_block <= safe
@@ -282,10 +357,7 @@ impl BlockWatcher {
             // Fresh start from a configured block: if possible back-fill via a
             // warp. Unlike resuming, there is no prior state, so do not emit a
             // fake reorg like we do when resuming.
-            self.queue.push_back(BlockUpdate::Warp {
-                from: start_block,
-                to: safe,
-            });
+            self.catch_up(start_block, safe);
         }
 
         // Query the `safe` block itself, plus everything after it, so we can
@@ -367,6 +439,55 @@ impl BlockWatcher {
         Ok(())
     }
 
+    /// Schedules catch-up over the final range `from..=to`: one sequential
+    /// block at a time in strict mode, otherwise a bulk warp.
+    fn catch_up(&mut self, from: u64, to: u64) {
+        if self.config.strict {
+            self.backfill = Some(Backfill {
+                next: from,
+                to,
+                prev: None,
+            });
+        } else {
+            self.queue.push_back(BlockUpdate::Warp { from, to });
+        }
+    }
+
+    /// Emits the next block of the sequential catch-up. Blocks are emitted in
+    /// order and each must extend the previous one; the last must be the
+    /// `safe` anchor established at initialization.
+    async fn next_backfilled(&mut self, backfill: Backfill) -> Result<BlockUpdate, Error> {
+        let number = backfill.next;
+        let block = self.require_block(BlockId::number(number)).await?;
+        let inconsistent = backfill.prev.is_some_and(|prev| prev != block.parent_hash)
+            || (number == backfill.to && block.hash != self.safe.hash)
+            || block.number != number;
+        if inconsistent {
+            if let Some(pool) = self.provider.pool() {
+                pool.report_failure(crate::rpc::Reason::InconsistentChain);
+            }
+            return Err(Error::InconsistentChain { number });
+        }
+
+        self.backfill = (number < backfill.to).then_some(Backfill {
+            next: number + 1,
+            prev: Some(block.hash),
+            ..backfill
+        });
+        if number.is_multiple_of(BACKFILL_HEAD_REFRESH) {
+            // Keep the observed head fresh during a long catch-up. A failure
+            // here is not worth failing the block over.
+            if let Ok(Some(head)) = self.get_block(BlockId::latest()).await {
+                self.observe_head(&head);
+            }
+        }
+        Ok(BlockUpdate::New {
+            number,
+            hash: block.hash,
+            logs_bloom: block.logs_bloom,
+        })
+    }
+
     /// Retrieves all ready updates without blocking.
     pub fn ready(&mut self) -> impl Iterator<Item = BlockUpdate> + '_ {
         self.queue.drain(..)
@@ -383,7 +504,16 @@ impl BlockWatcher {
     /// Retrieves the next block update from the watcher. This will block and
     /// wait for a new block to be produced if there is no update available.
     pub async fn next(&mut self) -> Result<BlockUpdate, Error> {
-        // Return a queued update immediately if one is available.
+        // A leading uncle always comes first, then any sequential catch-up,
+        // then the queued recent blocks.
+        if matches!(self.queue.front(), Some(BlockUpdate::Uncle { .. }))
+            && let Some(update) = self.queue.pop_front()
+        {
+            return Ok(update);
+        }
+        if let Some(backfill) = self.backfill {
+            return self.next_backfilled(backfill).await;
+        }
         if let Some(update) = self.queue.pop_front() {
             return Ok(update);
         }
@@ -393,6 +523,7 @@ impl BlockWatcher {
         let block = loop {
             self.wait_for_pending_block().await;
             if let Some(block) = self.get_block(BlockId::number(self.pending.number)).await? {
+                self.observe_head(&block);
                 break block;
             }
 
@@ -570,6 +701,7 @@ mod tests {
             block_retry_delays: vec![200, 100, 50],
             max_reorg_depth: 2,
             start_block: None,
+            strict: false,
         }
     }
 

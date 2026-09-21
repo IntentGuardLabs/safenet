@@ -17,7 +17,10 @@ use self::{
     storage::{Status, Submission, TransactionStorage},
     types::AllocatedTransaction,
 };
-pub use self::{signer::Signer, types::Transaction};
+pub use self::{
+    signer::{KeystoreError, Signer},
+    types::Transaction,
+};
 use crate::{index::BlockStatus, provider::Provider};
 use alloy::{
     eips::{BlockId, eip1559::Eip1559Estimation},

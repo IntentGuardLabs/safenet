@@ -11,7 +11,7 @@ mod state;
 use self::{config::Config, engine::EngineClient, service::SentinelService};
 use alloy::primitives::U256;
 use argh::FromArgs;
-use safenet_core::{Driver, observability, provider::Provider, utils};
+use safenet_core::{Driver, observability, utils};
 use std::{error::Error, path::PathBuf, time::Duration};
 
 #[derive(Debug, FromArgs)]
@@ -37,8 +37,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load(&options.config_file).await?;
     observability::init(config.observability)?;
     tracing::debug!(config_file = %options.config_file.display(), "sentinel configuration loaded");
+    // `main`'s error return prints `Debug`; log the operator-facing message too.
+    let signer = config
+        .signer
+        .load()
+        .inspect_err(|err| tracing::error!(%err, "failed to load signer"))?;
 
-    let provider = Provider::connect(&config.rpc).await?;
+    let provider = config.rpc.connect().await?;
     let pool = utils::connect_sqlite(config.database).await?;
     let chain_id = provider.chain_id();
 
@@ -65,7 +70,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.oracle,
         config.sentinel.fee_token,
         config.consensus,
-        config.signer.clone(),
+        signer.clone(),
         U256::from(chain_id),
         config.sentinel.voting_window,
         EngineClient::new(config.sentinel.engine)?,
@@ -75,7 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let driver = Driver::new(
         service,
         provider,
-        config.signer,
+        signer,
         pool,
         vec![config.oracle, config.consensus],
         config.driver,
@@ -83,7 +88,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     tracing::info!("starting sentinel service");
-    driver.run().await;
+    // A non-zero exit on unrecoverable errors (such as a reorg deeper than
+    // `max_reorg_depth`), so the orchestrator restarts/alerts.
+    driver.run_until_failure().await?;
 
     Ok(())
 }

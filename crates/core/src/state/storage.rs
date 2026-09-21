@@ -10,6 +10,7 @@
 //! everything above it. Snapshots below a `safe` block are pruned.
 
 use crate::index::BlockStatus;
+use alloy::primitives::B256;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::sqlite::SqlitePool;
 use std::{marker::PhantomData, num::TryFromIntError};
@@ -55,6 +56,19 @@ where
         )
         .execute(&pool)
         .await?;
+        // The block hash of each snapshot, so a restart can verify the stored
+        // cursor against the chain. Nullable: snapshots written before this
+        // column existed (or for warped ranges) have no hash.
+        let has_hash = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('snapshots') WHERE name = 'block_hash'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if has_hash == 0 {
+            sqlx::query("ALTER TABLE snapshots ADD COLUMN block_hash BLOB")
+                .execute(&pool)
+                .await?;
+        }
 
         Ok(Self {
             pool,
@@ -103,16 +117,46 @@ where
     /// Records `state` as the snapshot for `block_number`, replacing any existing
     /// snapshot at that block.
     pub async fn commit(&self, block_number: u64, state: &S) -> Result<(), Error> {
+        self.commit_with_hash(block_number, None, state).await
+    }
+
+    /// Commits the snapshot for `block_number`, recording the block's hash when
+    /// known. The snapshot and its cursor are one atomic row.
+    pub async fn commit_with_hash(
+        &self,
+        block_number: u64,
+        block_hash: Option<B256>,
+        state: &S,
+    ) -> Result<(), Error> {
         let state = serde_json::to_string(state)?;
         sqlx::query(
-            "INSERT INTO snapshots (block_number, state) VALUES (?, ?)
-             ON CONFLICT (block_number) DO UPDATE SET state = excluded.state",
+            "INSERT INTO snapshots (block_number, state, block_hash) VALUES (?, ?, ?)
+             ON CONFLICT (block_number) DO UPDATE
+             SET state = excluded.state, block_hash = excluded.block_hash",
         )
         .bind(i64::try_from(block_number)?)
         .bind(state)
+        .bind(block_hash.map(|hash| hash.to_vec()))
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The retained snapshots' `(block_number, block_hash)`, newest first.
+    pub async fn cursors(&self) -> Result<Vec<(u64, Option<B256>)>, Error> {
+        sqlx::query_as::<_, (i64, Option<Vec<u8>>)>(
+            "SELECT block_number, block_hash FROM snapshots ORDER BY block_number DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(number, hash)| {
+            Ok((
+                u64::try_from(number)?,
+                hash.and_then(|hash| B256::try_from(hash.as_slice()).ok()),
+            ))
+        })
+        .collect()
     }
 
     /// Rolls the store back, discarding `uncle` and every snapshot above it, and
@@ -191,6 +235,39 @@ mod tests {
         let store = store().await;
         assert_eq!(store.current().await.unwrap(), None);
         assert_eq!(store.status().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn persists_block_hashes_alongside_snapshots() {
+        let store = store().await;
+        store.commit(1, &state(10)).await.unwrap();
+        store
+            .commit_with_hash(2, Some(B256::repeat_byte(2)), &state(20))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.cursors().await.unwrap(),
+            [(2, Some(B256::repeat_byte(2))), (1, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn adds_the_hash_column_to_an_existing_database() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE snapshots (block_number INTEGER PRIMARY KEY, state TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO snapshots VALUES (5, '{\"value\":1}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = SnapshotStore::<State>::new(pool.clone()).await.unwrap();
+        // Idempotent, and old rows are preserved with no hash.
+        SnapshotStore::<State>::new(pool).await.unwrap();
+        assert_eq!(store.cursors().await.unwrap(), [(5, None)]);
     }
 
     #[tokio::test]

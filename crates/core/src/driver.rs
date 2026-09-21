@@ -14,6 +14,7 @@ use crate::{
     index::{self, BlockUpdate, Update, Watcher, events::Events},
     metrics::{self, ProcessingStatus},
     provider::Provider,
+    readiness::{self, Readiness},
     state::{self, StateMachine, StateTransition},
     tx::{self, Signer, Transaction, TransactionQueue},
     utils,
@@ -36,6 +37,8 @@ pub struct Config {
     pub index: index::Config,
     /// Transaction queue configuration.
     pub transactions: tx::Config,
+    /// Readiness configuration.
+    pub readiness: readiness::Config,
 }
 
 /// A state machine input.
@@ -105,6 +108,8 @@ where
     effects: EffectManager<S::Effects, S::Effect, S::Resume>,
     actions: S::Actions,
     transactions: TransactionQueue,
+    readiness: Readiness,
+    readiness_address: Option<std::net::SocketAddr>,
 }
 
 impl<S> Driver<S>
@@ -131,6 +136,14 @@ where
         let state = StateMachine::new(transition, pool.clone()).await?;
         let effects = EffectManager::new(effects);
         let block_status = state.block_status().await?;
+        if config.index.blocks.strict && block_status.is_some() {
+            // On restart, check the persisted cursor against a healthy endpoint
+            // before trusting it (rolls back or fails if it was reorged deeper
+            // than `max_reorg_depth` while offline).
+            let cursors = state.block_cursors().await?;
+            index::verify_resume(&provider, &cursors, config.index.blocks.max_reorg_depth).await?;
+        }
+        let readiness = Readiness::new(config.readiness.clone(), provider.pool().cloned());
         let watcher = Watcher::new(provider.clone(), config.index, addresses, block_status).await?;
         let transactions =
             TransactionQueue::new(provider, signer, pool, config.transactions).await?;
@@ -148,6 +161,8 @@ where
             effects,
             actions,
             transactions,
+            readiness,
+            readiness_address: config.readiness.address,
         })
     }
 
@@ -162,14 +177,30 @@ where
         Ok(())
     }
 
+    /// Runs the service until a shutdown signal or an unrecoverable error,
+    /// logging the error. See [`Driver::run_until_failure`] to get it back.
+    pub async fn run(self) {
+        if let Err(err) = self.run_until_failure().await {
+            tracing::error!(?err, "service stopped with an unrecoverable error");
+        }
+    }
+
     /// Runs the service, processing watcher updates and completed effects until
-    /// a shutdown signal (such as Ctrl-C) is received or an unrecoverable error
-    /// occurs.
+    /// a shutdown signal (such as Ctrl-C) is received (`Ok`) or an unrecoverable
+    /// error occurs (`Err`, so callers can exit non-zero).
     ///
     /// Failures while waiting for the next indexer update are retried after a
     /// short delay. Errors encountered after an update has been received are
     /// handled according to their component's recovery policy.
-    pub async fn run(mut self) {
+    pub async fn run_until_failure(mut self) -> Result<(), Error> {
+        if let Some(address) = self.readiness_address {
+            let readiness = self.readiness.clone();
+            tokio::spawn(async move {
+                if let Err(err) = readiness.serve(address).await {
+                    tracing::error!(%err, "readiness endpoint stopped");
+                }
+            });
+        }
         let shutdown = utils::shutdown_signal();
         tokio::pin!(shutdown);
 
@@ -178,7 +209,7 @@ where
                 biased;
                 _ = shutdown.as_mut() => {
                     tracing::info!("received shutdown signal; stopping service");
-                    break;
+                    return Ok(());
                 },
                 input = self.next_input() => input,
             };
@@ -188,13 +219,19 @@ where
             let result = match input {
                 Err(err) => {
                     tracing::error!(?err, "unrecoverable watcher error; exiting");
-                    break;
+                    self.readiness.reorg_exceeded();
+                    self.readiness.refresh();
+                    return Err(err.into());
                 }
                 Ok(input) => self.update(input).await,
             };
             if let Err(err) = result {
                 tracing::error!(?err, "unrecoverable driver error; exiting");
-                break;
+                if matches!(err, Error::State(state::Error::Storage(_))) {
+                    self.readiness.persistence_failed();
+                }
+                self.readiness.refresh();
+                return Err(err);
             }
         }
     }
@@ -220,6 +257,12 @@ where
                             ?err,
                             "failed to get next blockchain update; retrying after delay"
                         );
+                        metrics::block_processing_retries_total().increment(1);
+                        self.readiness.retry(matches!(
+                            err,
+                            index::Error::Events(index::events::Error::LogDisagreement { .. })
+                        ));
+                        self.readiness.refresh();
                         tokio::time::sleep(STEP_RETRY_DELAY).await;
                     }
                 }
@@ -258,8 +301,21 @@ where
                     Update::Block(BlockUpdate::New { .. }) => Some(block_status),
                     _ => None,
                 };
+                let processed_block = recorder.processed_block();
                 let commands = self.state.handle_update(update).await?;
                 recorder.processed();
+                if let Some(block) = processed_block {
+                    self.readiness.processed(block);
+                    self.readiness.head(block_status.latest);
+                    let lag = block_status.latest.saturating_sub(block);
+                    metrics::processed_block_lag().set(lag as f64);
+                    metrics::last_processed_block_timestamp().set(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0.0, |d| d.as_secs_f64()),
+                    );
+                    self.readiness.refresh();
+                }
                 self.state.prune(block_status.safe).await?;
                 (commands, housekeeping)
             }
@@ -318,6 +374,10 @@ impl UpdateRecorder {
             metrics::block_number(ProcessingStatus::Seen).set(block as f64);
         }
         Self(processed)
+    }
+
+    fn processed_block(&self) -> Option<u64> {
+        self.0
     }
 
     fn processed(self) {

@@ -8,7 +8,10 @@ mod clock;
 pub mod events;
 
 use crate::provider::Provider;
-use alloy::{primitives::Address, rpc::types::error::EthRpcErrorCode};
+use alloy::{
+    primitives::{Address, B256},
+    providers::Provider as _,
+};
 use blocks::BlockWatcher;
 use events::{EventWatcher, Events};
 use serde::Deserialize;
@@ -37,6 +40,66 @@ pub enum Error {
     /// An error from the event watcher.
     #[error(transparent)]
     Events(#[from] events::Error),
+    /// The active RPC endpoint cannot serve an already processed block.
+    #[error("RPC endpoint cannot serve the processed block {0}")]
+    EndpointBehind(u64),
+}
+
+/// Verifies the persisted cursor against the chain on restart, using
+/// `cursors` (`(block_number, block_hash)` of the retained snapshots, newest
+/// first). The newest snapshot whose stored hash still matches the chain is the
+/// common ancestor; the watcher then rolls back to its safe snapshot and
+/// replays. If none match, the reorg is deeper than the retained history and
+/// [`blocks::Error::ExceededMaxReorgDepth`] is returned. Snapshots without a
+/// stored hash (written by older versions) cannot be verified and are trusted.
+///
+/// An endpoint that cannot serve a persisted block (it is behind) is
+/// quarantined and the next one is asked, so provider lag is never mistaken
+/// for a reorg.
+pub async fn verify_resume(
+    provider: &Provider,
+    cursors: &[(u64, Option<B256>)],
+    max_reorg_depth: u64,
+) -> Result<(), Error> {
+    let attempts = provider.pool().map_or(1, |pool| pool.status().len());
+    for &(number, hash) in cursors {
+        let Some(hash) = hash else {
+            tracing::warn!(
+                number,
+                "persisted snapshot has no block hash; cannot verify it"
+            );
+            return Ok(());
+        };
+        let mut served = None;
+        for _ in 0..attempts {
+            match provider
+                .get_block(number.into())
+                .await
+                .map_err(|err| Error::Blocks(err.into()))?
+            {
+                Some(block) => {
+                    served = Some(block.header.hash);
+                    break;
+                }
+                None => match provider.pool() {
+                    Some(pool) => pool.quarantine_active(crate::rpc::Reason::MissingBlock),
+                    None => break,
+                },
+            }
+        }
+        match served {
+            Some(chain_hash) if chain_hash == hash => return Ok(()),
+            Some(_) => tracing::warn!(number, "persisted block was reorged while offline"),
+            None => return Err(Error::EndpointBehind(number)),
+        }
+    }
+    if cursors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Blocks(blocks::Error::ExceededMaxReorgDepth(
+            max_reorg_depth,
+        )))
+    }
 }
 
 /// An update produced by the [`Watcher`].
@@ -56,8 +119,16 @@ pub enum Update<E> {
 /// Watches the chain head and the logs of the events `E`, producing an ordered
 /// stream of [`Update`]s.
 pub struct Watcher<E> {
+    provider: Provider,
     blocks: BlockWatcher,
     events: EventWatcher<E>,
+    /// The last block emitted as a new block, awaiting its logs.
+    current: Option<(u64, B256)>,
+    /// The last block whose logs were emitted (and so, by the driver's
+    /// contract, processed before the next call).
+    cursor: Option<(u64, B256)>,
+    /// The endpoint epoch the cursor was last confirmed against.
+    epoch: u64,
 }
 
 impl<E> Watcher<E>
@@ -74,8 +145,16 @@ where
         indexed: Option<BlockStatus>,
     ) -> Result<Self, Error> {
         let blocks = BlockWatcher::new(provider.clone(), config.blocks, indexed).await?;
-        let events = EventWatcher::new(provider, config.events, addresses);
-        Ok(Self { blocks, events })
+        let events = EventWatcher::new(provider.clone(), config.events, addresses);
+        let epoch = provider.pool().map_or(0, |pool| pool.epoch());
+        Ok(Self {
+            provider,
+            blocks,
+            events,
+            current: None,
+            cursor: None,
+            epoch,
+        })
     }
 
     /// Produces the next watcher update.
@@ -83,17 +162,69 @@ where
     /// Returns the next batch of logs or blocks and waits for a new block to
     /// be mined.
     pub async fn next(&mut self) -> Result<Update<E>, Error> {
+        self.verify_endpoint().await?;
         if let Some(events) = self.next_logs().await? {
             // The query produced an update for the blocks it covers; return it,
             // even when empty, so consumers can commit state across the range.
+            if let Some((number, _)) = self.current
+                && number == events.blocks.last
+            {
+                self.cursor = self.current;
+            }
             Ok(Update::Logs(events))
         } else {
+            // A unit of work (one block and its logs) is complete: this is the
+            // only point where a recovered higher-priority endpoint may become
+            // the primary again.
+            if let Some(pool) = self.provider.pool() {
+                pool.checkpoint().await;
+            }
+            self.verify_endpoint().await?;
+
             // The event watcher is drained, so advance the chain head and hand
             // the update to the event watcher to fetch its logs from.
             let update = self.blocks.next().await?;
+            match &update {
+                BlockUpdate::New { number, hash, .. } => self.current = Some((*number, *hash)),
+                BlockUpdate::Uncle { number } => {
+                    if self.cursor.is_some_and(|(n, _)| n >= *number) {
+                        self.cursor = None;
+                    }
+                }
+                BlockUpdate::Warp { .. } => {}
+            }
             self.events.on_block_update(update.clone())?;
             Ok(Update::Block(update))
         }
+    }
+
+    /// After the active endpoint changed, confirms the new one can still serve
+    /// the last processed block. An endpoint that cannot (it is behind the
+    /// cursor) is quarantined and the caller retries on the next one. A merely
+    /// *lagging* endpoint, one that has the cursor block but not yet the next,
+    /// is fine and never treated as a reorg; a different hash at the cursor is
+    /// left to the normal parent-hash reorg handling.
+    async fn verify_endpoint(&mut self) -> Result<(), Error> {
+        let Some(pool) = self.provider.pool() else {
+            return Ok(());
+        };
+        let epoch = pool.epoch();
+        if epoch == self.epoch {
+            return Ok(());
+        }
+        if let Some((number, _)) = self.cursor {
+            let block = self
+                .provider
+                .get_block(number.into())
+                .await
+                .map_err(|err| Error::Blocks(err.into()))?;
+            if block.is_none() {
+                pool.quarantine_active(crate::rpc::Reason::MissingBlock);
+                return Err(Error::EndpointBehind(number));
+            }
+        }
+        self.epoch = epoch;
+        Ok(())
     }
 
     /// Returns the block watcher's current view of the chain.
@@ -130,14 +261,14 @@ where
     }
 }
 
-/// Whether an event watcher failure was caused by a JSON-RPC "resource not
-/// found" error. See [EIP-1474](https://eips.ethereum.org/EIPS/eip-1474).
+/// Whether an event watcher failure means the endpoint cannot serve logs for a
+/// block (uncled, not yet synced or pruned): "resource not found" (EIP-1474) or
+/// the equivalent `-32000` "unknown block"/"header not found" messages.
 fn is_resource_not_found(err: &events::Error) -> bool {
     matches!(
         err,
         events::Error::Rpc(rpc)
-            if rpc.as_error_resp().is_some_and(|payload| payload.code
-                == EthRpcErrorCode::ResourceNotFound.code() as i64)
+            if rpc.as_error_resp().is_some_and(crate::rpc::classify::is_block_unavailable)
     )
 }
 
@@ -165,6 +296,7 @@ mod tests {
                 block_retry_delays: vec![],
                 max_reorg_depth: 3,
                 start_block: None,
+                strict: false,
             },
             events: Default::default(),
         }
@@ -208,6 +340,7 @@ mod tests {
                     block_retry_delays: vec![50, 75],
                     max_reorg_depth: 3,
                     start_block: Some(100),
+                    strict: false,
                 },
                 events: events::Config {
                     block_page_size: std::num::NonZeroU64::new(50).expect("50 is nonzero"),
@@ -218,6 +351,7 @@ mod tests {
                         std::num::NonZeroUsize::new(1000).expect("1000 is nonzero"),
                     ),
                     fallible_events: Default::default(),
+                    verify_integrity: false,
                 },
             },
         );

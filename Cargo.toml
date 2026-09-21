@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.dependencies]
-alloy = { version = "2", features = ["full", "json-rpc"] }
+alloy = { version = "2", features = ["full", "json-rpc", "signer-keystore-geth-compat"] }
 argh = "0.1"
 async-trait = "0.1"
 axum = "0.8"

@@ -89,6 +89,12 @@ pub struct Config {
     /// The topic0 of events that may be dropped on failure rather than
     /// propagating the error. Use this to mark events as noncritical.
     pub fallible_events: BTreeSet<B256>,
+    /// Verify each block's logs for integrity (set by services that opt in,
+    /// not by TOML): every log must match the block, addresses, topics and the
+    /// header bloom, and an empty result the bloom says may be wrong is
+    /// confirmed against a second endpoint.
+    #[serde(skip)]
+    pub verify_integrity: bool,
 }
 
 impl Default for Config {
@@ -99,6 +105,7 @@ impl Default for Config {
             use_client_filtering: false,
             max_logs_per_query: None,
             fallible_events: BTreeSet::new(),
+            verify_integrity: false,
         }
     }
 }
@@ -122,6 +129,15 @@ pub enum Error {
     IncompleteLogs { block_hash: B256 },
     /// A block update arrived while the watcher was still processing the
     /// previous one.
+    /// The endpoint's logs are inconsistent with the block or its bloom.
+    #[error("logs for block {block_hash:?} are inconsistent with the block")]
+    InconsistentLogs { block_hash: B256 },
+    /// Two endpoints returned different logs for the same block.
+    #[error("endpoints disagree about the logs of block {block_hash:?}")]
+    LogDisagreement { block_hash: B256 },
+    /// The logs could not be verified against a second endpoint.
+    #[error("cannot verify the logs of block {block_hash:?} against a second endpoint")]
+    VerificationUnavailable { block_hash: B256 },
     #[error("received a block update while not idle")]
     UnexpectedBlockUpdate,
     /// A block invalidation arrived that does not match the block whose logs are
@@ -379,7 +395,14 @@ where
             Fetch::MultipleQueries(BlockFilter::Hash(block_hash))
         };
 
-        let result = self.fetch_logs(fetch).await;
+        let result = if self.config.verify_integrity
+            && retries < self.config.block_single_query_retry_count.get()
+        {
+            self.fetch_verified(block_number, block_hash, logs_bloom)
+                .await
+        } else {
+            self.fetch_logs(fetch).await
+        };
         self.step = if result.is_ok() {
             Step::Idle
         } else {
@@ -395,6 +418,99 @@ where
             blocks: range(block_number..=block_number),
             logs,
         })
+    }
+
+    /// Fetches one block's logs by exact block hash, restricted to the watched
+    /// addresses and topics, and checks their integrity.
+    async fn fetch_verified(
+        &self,
+        number: u64,
+        hash: B256,
+        bloom: Bloom,
+    ) -> Result<Vec<EventLog<E>>, Error> {
+        let filter = BlockFilter::Hash(hash)
+            .into_filter()
+            .address(self.addresses.clone())
+            .event_signature(self.topics.clone());
+        let logs = self.provider.get_logs(&filter).await?;
+        let logs = self.check_logs_limit(logs)?;
+        if !self.consistent(&logs, number, hash, &bloom) {
+            self.report(crate::rpc::Reason::InconsistentLogs);
+            return Err(Error::InconsistentLogs { block_hash: hash });
+        }
+        // The bloom is a one-sided check: it proves the *absence* of logs, not
+        // their presence. An empty answer the bloom does not rule out may be a
+        // silently dropped result, so confirm it with a second endpoint (a
+        // verification, not load balancing). A false-positive bloom is fine:
+        // both endpoints then agree on empty.
+        if logs.is_empty() && bloom::may_contain_log(&bloom, &self.addresses, &self.topics) {
+            self.verify_empty(&filter, number, hash, &bloom).await?;
+        }
+        decode_and_sort(&logs)
+    }
+
+    async fn verify_empty(
+        &self,
+        filter: &Filter,
+        number: u64,
+        hash: B256,
+        bloom: &Bloom,
+    ) -> Result<(), Error> {
+        let Some(pool) = self.provider.pool() else {
+            return Ok(()); // no second endpoint to ask
+        };
+        let Some((name, secondary)) = self.provider.secondary() else {
+            // A single-endpoint setup cannot verify; with several configured,
+            // failing to reach any other one must not be treated as agreement.
+            return if pool.status().len() > 1 {
+                Err(Error::VerificationUnavailable { block_hash: hash })
+            } else {
+                Ok(())
+            };
+        };
+        let other = secondary
+            .get_logs(filter)
+            .await
+            .map_err(|_| Error::VerificationUnavailable { block_hash: hash })?;
+        if same_logs(&[], &other) {
+            return Ok(());
+        }
+        tracing::warn!(
+            secondary = &*name,
+            block = number,
+            "endpoints disagree about a block's logs"
+        );
+        crate::metrics::log_integrity_disagreements_total().increment(1);
+        // If the second endpoint's answer is internally consistent and backed
+        // by the header bloom, the canonical result is established and the
+        // endpoint that returned nothing is quarantined; either way the cursor
+        // does not advance (the caller retries after backoff).
+        if self.consistent(&other, number, hash, bloom) {
+            pool.quarantine_active(crate::rpc::Reason::InconsistentLogs);
+        }
+        Err(Error::LogDisagreement { block_hash: hash })
+    }
+
+    /// Whether `logs` are all real, in-block, watched and bloom-backed logs.
+    fn consistent(&self, logs: &[Log], number: u64, hash: B256, bloom: &Bloom) -> bool {
+        let mut seen = BTreeSet::new();
+        logs.iter().all(|log| {
+            let Some(topic) = log.topic0() else {
+                return false;
+            };
+            log.block_hash == Some(hash)
+                && log.block_number == Some(number)
+                && log.log_index.is_some_and(|index| seen.insert(index))
+                && self.addresses.contains(&log.address())
+                && self.topics.contains(topic)
+                && bloom::may_contain_log(bloom, &[log.address()], &[*topic])
+        })
+    }
+
+    fn report(&self, reason: crate::rpc::Reason) {
+        if let Some(pool) = self.provider.pool() {
+            pool.report_failure(reason);
+        }
     }
 
     /// Fetches the watched logs for some blocks using the given strategy,
@@ -488,6 +604,39 @@ where
 
 /// Decodes logs into the typed event set and sorts them into
 /// `(block_number, log_index)` order.
+/// The stable identity of a log, for comparing two endpoints' answers.
+type LogIdentity = (
+    Option<B256>,
+    Option<B256>,
+    Option<u64>,
+    Address,
+    Vec<B256>,
+    Vec<u8>,
+);
+
+fn identities(logs: &[Log]) -> Vec<LogIdentity> {
+    let mut ids: Vec<_> = logs
+        .iter()
+        .map(|log| {
+            (
+                log.block_hash,
+                log.transaction_hash,
+                log.log_index,
+                log.address(),
+                log.topics().to_vec(),
+                log.data().data.to_vec(),
+            )
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Whether two endpoints returned the same relevant logs.
+fn same_logs(a: &[Log], b: &[Log]) -> bool {
+    identities(a) == identities(b)
+}
+
 fn decode_and_sort<E>(logs: &[Log]) -> Result<Vec<EventLog<E>>, Error>
 where
     E: Events,

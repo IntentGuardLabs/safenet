@@ -17,6 +17,8 @@ pub mod kdf;
 mod metrics;
 pub mod observability;
 pub mod provider;
+pub mod readiness;
+pub mod rpc;
 pub mod serialization;
 pub mod state;
 pub mod tx;

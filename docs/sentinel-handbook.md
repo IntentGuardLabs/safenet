@@ -48,7 +48,9 @@ metrics_address = "0.0.0.0:3555"
 
 Each sentinel must be provisioned with a `secp256k1` private key. This key is used to authenticate the sentinel onchain for participation in Safenet Testnet. It must be funded with sufficient gas for the EVM transactions required for onchain commit/reveal communication, and with enough of the fee token to put up bonds on the requests it votes on.
 
-> [!TIP] The sentinel currently requires the private key at startup and does not support any KMS systems. Do not use this key for anything else, especially security-related tasks. Use it only for running the sentinel, and fund it only with the amount needed for gas and bonds. In the future, we plan to support KMS systems for more secure setups.
+In production, store the key as an encrypted Web3 Secret Storage (Geth-compatible) keystore and reference it with a `[signer]` table in your configuration; the password is read from a separate file. See [Sentinel Keystore Operations](./sentinel-keystore.md) for creation, provisioning, Docker Compose deployment, rotation, backup and migration from the deprecated inline `signer = "0x..."` format.
+
+> [!TIP] The sentinel decrypts the key in memory at startup and does not support any KMS systems. Do not use this key for anything else, especially security-related tasks. Use it only for running the sentinel, and fund it only with the amount needed for gas and bonds. In the future, we plan to support KMS systems for more secure setups.
 
 ##### Gas Costs
 
@@ -65,7 +67,7 @@ cp crates/sentinel/sentinel.sample.toml sentinel.toml
 $EDITOR sentinel.toml
 ```
 
-Use the provided OCI image to run the sentinel, passing the configuration file's path via `--config-file`. The image's `ENTRYPOINT` is the `sentinel` binary itself, so this flag is appended directly as the container command. The example below assumes the reference engine is already running as `safenet-sentinel-engine` on the private `safenet-sentinel` network created in the [engine guide](./sentinel-engine.md#running-the-reference-engine), the sentinel config uses `engine = "http://safenet-sentinel-engine:5473"`, and `database` points at a file under `/var/lib/safenet/sentinel/data`:
+Use the provided OCI image to run the sentinel, passing the configuration file's path via `--config-file <path>` (the flag and value are separate arguments; `--config-file=<path>` is not accepted). For production deployments with an encrypted keystore, use the [Compose example](../deploy/sentinel/compose.prod.yaml) described in [Sentinel Keystore Operations](./sentinel-keystore.md) instead of the simplified command below. The image's `ENTRYPOINT` is the `sentinel` binary itself, so this flag is appended directly as the container command. The example below assumes the reference engine is already running as `safenet-sentinel-engine` on the private `safenet-sentinel` network created in the [engine guide](./sentinel-engine.md#running-the-reference-engine), the sentinel config uses `engine = "http://safenet-sentinel-engine:5473"`, and `database` points at a file under `/var/lib/safenet/sentinel/data`:
 
 ```sh
 docker run --name safenet-sentinel \
@@ -73,7 +75,7 @@ docker run --name safenet-sentinel \
     --volume "$(pwd)/sentinel.toml:/usr/src/app/sentinel.toml" \
     --volume sentinel-data:/var/lib/safenet/sentinel/data \
     ghcr.io/safe-research/safenet-sentinel:main \
-    --config-file=sentinel.toml
+    --config-file sentinel.toml
 ```
 
 ## Debugging

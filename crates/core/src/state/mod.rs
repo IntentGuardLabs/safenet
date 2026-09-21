@@ -8,6 +8,7 @@ pub mod storage;
 
 use self::storage::SnapshotStore;
 use crate::index::{BlockStatus, BlockUpdate, EventLog, EventUpdate, Update};
+use alloy::primitives::B256;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::SqlitePool;
 use std::{mem, range::RangeInclusive};
@@ -100,6 +101,9 @@ pub type Commands<S, T> =
 /// A service state machine.
 pub struct StateMachine<S, T> {
     inner: Mutex<Option<(S, Status)>>,
+    /// The block most recently opened by a `New` update, so its hash is
+    /// persisted with the snapshot committed once its logs are applied.
+    current_block: Option<(u64, B256)>,
     snapshots: SnapshotStore<S>,
     transition: T,
 }
@@ -145,6 +149,7 @@ where
 
         Ok(Self {
             inner,
+            current_block: None,
             snapshots,
             transition,
         })
@@ -155,6 +160,12 @@ where
     ///
     /// The latest snapshot is the indexer's resume point, while the safe
     /// snapshot is the earliest rollback anchor retained in storage.
+    /// The persisted `(block_number, block_hash)` of every retained snapshot,
+    /// newest first. Hashes are `None` for snapshots that recorded none.
+    pub async fn block_cursors(&self) -> Result<Vec<(u64, Option<B256>)>, Error> {
+        Ok(self.snapshots.cursors().await?)
+    }
+
     pub async fn block_status(&self) -> Result<Option<BlockStatus>, Error> {
         Ok(self.snapshots.status().await?)
     }
@@ -187,10 +198,11 @@ where
                 let status = Status::BlockPending { pending: number };
                 (state, status, vec![])
             }
-            Update::Block(BlockUpdate::New { number, .. })
+            Update::Block(BlockUpdate::New { number, hash, .. })
                 if matches!(status, Status::Initialized)
                     || matches!(status, Status::BlockPending { pending } if pending == number) =>
             {
+                self.current_block = Some((number, hash));
                 let (state, commands) = self
                     .transition
                     .apply_transition(state, Message::NewBlock(number));
@@ -233,7 +245,13 @@ where
                     }
                 };
 
-                self.snapshots.commit(blocks.last, &state).await?;
+                let hash = self
+                    .current_block
+                    .filter(|(number, _)| *number == blocks.last)
+                    .map(|(_, hash)| hash);
+                self.snapshots
+                    .commit_with_hash(blocks.last, hash, &state)
+                    .await?;
 
                 (state, status, commands)
             }

@@ -14,11 +14,13 @@ hkdf = "0.13"
 k256.workspace = true
 metrics-exporter-prometheus = "0.18"
 metrics.workspace = true
+rand.workspace = true
 regex = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"
 sqlx.workspace = true
+tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-metrics = { version = "0.5", features = ["metrics-rs-integration"] }
@@ -28,4 +30,5 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+toml.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
