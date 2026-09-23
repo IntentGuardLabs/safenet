@@ -7,7 +7,7 @@ use crate::{
     bindings::consensus::SafeTransaction,
     engine::{CheckOutcome, EngineClient},
 };
-use alloy::primitives::B256;
+use alloy::{eips::BlockNumberOrTag, primitives::B256};
 use safenet_core::effects::EffectHandler;
 use std::time::Duration;
 
@@ -16,12 +16,13 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Defer the approve/deny decision for `request_id` (a proposed
-    /// `transaction` on `safe`) to the configured sentinel engine. `block` is
-    /// the block number the sentinel considers current.
+    /// `transaction` on `safe`) to the configured sentinel engine.
+    /// `proposal_timestamp` is the timestamp of the consensus-chain block the
+    /// transaction was proposed in, if the node reported it.
     EngineCheck {
         request_id: B256,
         transaction: SafeTransaction,
-        block: u64,
+        proposal_timestamp: Option<u64>,
     },
 }
 
@@ -57,15 +58,20 @@ impl EffectHandler<Effect, Resume> for Handler {
             Effect::EngineCheck {
                 request_id,
                 transaction,
-                block,
+                proposal_timestamp,
             } => {
-                let outcome = self
+                // The sentinel only follows the consensus chain, so it has no
+                // block of its own on the chain `transaction` executes on:
+                // defer to the engine's view of that chain's latest block.
+                let mut check = self
                     .engine
-                    .security_check(block, &transaction)
+                    .security_check(BlockNumberOrTag::Latest, &transaction)
                     .request_id(request_id)
-                    .timeout(self.engine_timeout)
-                    .execute()
-                    .await;
+                    .timeout(self.engine_timeout);
+                if let Some(timestamp) = proposal_timestamp {
+                    check = check.proposal_timestamp(timestamp);
+                }
+                let outcome = check.execute().await;
                 Resume::EngineCheckResult {
                     request_id,
                     outcome,
@@ -119,7 +125,7 @@ mod tests {
                     safe: SAFE,
                     ..Default::default()
                 },
-                block: 1,
+                proposal_timestamp: Some(1_700_000_000),
             })
             .await;
 
