@@ -131,8 +131,15 @@ pub struct KeystoreConfig {
     /// directory containing the configuration file.
     pub path: PathBuf,
     /// File containing the keystore password, verbatim (no trimming).
-    /// Relative paths are resolved like `path`.
-    pub password_file: PathBuf,
+    /// Relative paths are resolved like `path`. Exactly one of `password_file`
+    /// and `password_env` must be set.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+    /// Name of an environment variable containing the keystore password,
+    /// verbatim (no trimming), read once at startup. Exactly one of
+    /// `password_file` and `password_env` must be set.
+    #[serde(default)]
+    pub password_env: Option<String>,
     /// The address the keystore must decrypt to. Mandatory, so that mounting
     /// the wrong keystore fails startup instead of silently changing identity.
     pub expected_address: Address,
@@ -145,11 +152,15 @@ impl SignerConfig {
     pub fn load(self) -> Result<Signer, KeystoreError> {
         match self {
             Self::Keystore(config) => {
-                let signer = Signer::from_keystore(
-                    &config.path,
-                    &config.password_file,
-                    config.expected_address,
-                )?;
+                let signer = match (&config.password_file, &config.password_env) {
+                    (Some(file), _) => {
+                        Signer::from_keystore(&config.path, file, config.expected_address)?
+                    }
+                    (None, Some(name)) => {
+                        Signer::from_keystore_env(&config.path, name, config.expected_address)?
+                    }
+                    (None, None) => unreachable!("validated when deserializing"),
+                };
                 tracing::info!(address = %signer.address(), "loaded signer from keystore");
                 Ok(signer)
             }
@@ -166,7 +177,9 @@ impl SignerConfig {
     fn resolve_paths(&mut self, base: &Path) {
         if let Self::Keystore(config) = self {
             config.path = base.join(&config.path);
-            config.password_file = base.join(&config.password_file);
+            if let Some(file) = &mut config.password_file {
+                *file = base.join(&*file);
+            }
         }
     }
 }
@@ -192,6 +205,11 @@ impl<'de> Deserialize<'de> for SignerConfig {
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
                 let TaggedSignerConfig::Keystore(config) =
                     TaggedSignerConfig::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                if config.password_file.is_some() == config.password_env.is_some() {
+                    return Err(de::Error::custom(
+                        "`[signer]` must set exactly one of `password_file` or `password_env`",
+                    ));
+                }
                 Ok(SignerConfig::Keystore(config))
             }
         }
@@ -376,11 +394,37 @@ mod tests {
             panic!("expected keystore signer");
         };
         assert_eq!(keystore.path, Path::new("secrets/keystore.json"));
-        assert_eq!(keystore.password_file, Path::new("/run/secrets/password"));
+        assert_eq!(
+            keystore.password_file.as_deref(),
+            Some(Path::new("/run/secrets/password"))
+        );
         assert_eq!(
             keystore.expected_address,
             address!("0x0404040404040404040404040404040404040404")
         );
+    }
+
+    #[test]
+    fn keystore_password_comes_from_exactly_one_source() {
+        let env = KEYSTORE_TOML.replace(
+            "password_file = \"/run/secrets/password\"",
+            "password_env = \"SENTINEL_KEYSTORE_PASSWORD\"",
+        );
+        let config = toml::from_str::<Config>(&env).unwrap();
+        let SignerConfig::Keystore(keystore) = config.signer else {
+            panic!("expected keystore signer");
+        };
+        assert_eq!(
+            keystore.password_env.as_deref(),
+            Some("SENTINEL_KEYSTORE_PASSWORD")
+        );
+        assert!(keystore.password_file.is_none());
+
+        let both = KEYSTORE_TOML.replace(
+            "password_file",
+            "password_env = \"X\"\n        password_file",
+        );
+        assert!(toml::from_str::<Config>(&both).is_err());
     }
 
     #[test]

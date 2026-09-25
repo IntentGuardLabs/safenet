@@ -15,6 +15,7 @@ expected_address = "0x..."
 | `type`             | Must be `"keystore"` (the only supported value).                                                                                |
 | `path`             | The encrypted keystore. Only read, never written.                                                                               |
 | `password_file`    | File holding the password, **read byte-for-byte**. Only read, never written.                                                    |
+| `password_env`     | Alternative to `password_file`: the _name_ of an environment variable holding the password, **read byte-for-byte** once at startup. Set exactly one of the two. |
 | `expected_address` | Mandatory. After decryption the derived address must match exactly, otherwise startup is refused (guards against wrong mounts). |
 
 Relative `path`/`password_file` values resolve against the directory of the TOML file, not the working directory. Absolute paths are used as-is. Paths are not canonicalized, so neither file needs to be writable.

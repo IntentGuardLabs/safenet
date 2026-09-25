@@ -16,7 +16,7 @@ use url::Url;
 const MAX_URL_FILE_LEN: u64 = 4096;
 
 /// A URL that may carry credentials. Its `Debug` and `Display` never show it.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecretUrl(Url);
 
 impl SecretUrl {
@@ -64,6 +64,8 @@ pub struct Endpoint {
 pub enum ConfigError {
     #[error("`rpc.endpoints` must list at least one endpoint")]
     NoEndpoints,
+    #[error("RPC endpoint {0:?} must set exactly one of `url` or `url_file`")]
+    UrlSource(String),
     #[error("invalid RPC endpoint name {0:?}: use 1-32 characters from [A-Za-z0-9_-]")]
     InvalidName(String),
     #[error("duplicate RPC endpoint name {0:?}")]
@@ -90,9 +92,15 @@ pub enum ConfigError {
 pub struct EndpointConfig {
     /// The endpoint's name: the only way it is identified in logs and metrics.
     pub name: String,
+    /// The endpoint URL, inline. It may contain credentials, which then sit in
+    /// the configuration file; prefer `url_file` for such URLs. Exactly one of
+    /// `url` and `url_file` must be set.
+    #[serde(default)]
+    pub url: Option<SecretUrl>,
     /// File holding the endpoint URL. Leading/trailing whitespace (such as a
     /// trailing newline) is trimmed; the URL may contain credentials.
-    pub url_file: PathBuf,
+    #[serde(default)]
+    pub url_file: Option<PathBuf>,
 }
 
 /// The `[rpc]` table.
@@ -149,6 +157,9 @@ impl Config {
             if !seen.insert(endpoint.name.as_str()) {
                 return Err(ConfigError::DuplicateName(endpoint.name.clone()));
             }
+            if endpoint.url.is_some() == endpoint.url_file.is_some() {
+                return Err(ConfigError::UrlSource(endpoint.name.clone()));
+            }
         }
         Ok(())
     }
@@ -157,7 +168,9 @@ impl Config {
     /// configuration file).
     pub fn resolve_paths(&mut self, base: &Path) {
         for endpoint in &mut self.endpoints {
-            endpoint.url_file = base.join(&endpoint.url_file);
+            if let Some(file) = &mut endpoint.url_file {
+                *file = base.join(&*file);
+            }
         }
     }
 
@@ -172,13 +185,29 @@ impl Config {
 fn load_endpoint(config: &EndpointConfig) -> Result<Endpoint, ConfigError> {
     use std::io::Read as _;
     let name = config.name.clone();
+    let url_file = match (&config.url, &config.url_file) {
+        (Some(url), None) => {
+            if !matches!(url.expose().scheme(), "http" | "https") {
+                return Err(ConfigError::InvalidUrl {
+                    name,
+                    path: PathBuf::new(),
+                });
+            }
+            return Ok(Endpoint {
+                name: Arc::from(config.name.as_str()),
+                url: url.clone(),
+            });
+        }
+        (None, Some(file)) => file,
+        _ => return Err(ConfigError::UrlSource(name)),
+    };
     let io_err = |err: std::io::Error| ConfigError::UrlFile {
         name: name.clone(),
-        path: config.url_file.clone(),
+        path: url_file.clone(),
         kind: err.kind(),
     };
     let mut raw = String::new();
-    fs::File::open(&config.url_file)
+    fs::File::open(url_file)
         .map_err(io_err)?
         .take(MAX_URL_FILE_LEN + 1)
         .read_to_string(&mut raw)
@@ -186,7 +215,7 @@ fn load_endpoint(config: &EndpointConfig) -> Result<Endpoint, ConfigError> {
             if err.kind() == std::io::ErrorKind::InvalidData {
                 ConfigError::UrlFileContents {
                     name: name.clone(),
-                    path: config.url_file.clone(),
+                    path: url_file.clone(),
                 }
             } else {
                 io_err(err)
@@ -196,12 +225,12 @@ fn load_endpoint(config: &EndpointConfig) -> Result<Endpoint, ConfigError> {
     if trimmed.is_empty() || raw.len() as u64 > MAX_URL_FILE_LEN {
         return Err(ConfigError::UrlFileContents {
             name,
-            path: config.url_file.clone(),
+            path: url_file.clone(),
         });
     }
     let invalid = || ConfigError::InvalidUrl {
         name: config.name.clone(),
-        path: config.url_file.clone(),
+        path: url_file.clone(),
     };
     let url = Url::parse(trimmed).map_err(|_| invalid())?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -282,13 +311,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields_and_inline_urls() {
-        assert!(toml::from_str::<Config>(&format!("{TWO}\nurl = \"http://x\"")).is_err());
+    fn rejects_unknown_fields_and_requires_exactly_one_url_source() {
+        assert!(toml::from_str::<Config>(&format!("{TWO}\nbogus = 1")).is_err());
+
+        // Both `url` and `url_file`, or neither, is an error.
+        let mut c = config(TWO);
+        c.endpoints[0].url = Some(SecretUrl::new(Url::parse("http://127.0.0.1:8545").unwrap()));
+        assert!(matches!(c.validate(), Err(ConfigError::UrlSource(_))));
+        c.endpoints[0].url_file = None;
+        c.validate().unwrap();
+        c.endpoints[0].url = None;
+        assert!(matches!(c.validate(), Err(ConfigError::UrlSource(_))));
+    }
+
+    #[test]
+    fn loads_inline_urls_and_redacts_them() {
         let inline = TWO.replace(
             "url_file = \"/run/secrets/rpc-primary-url\"",
-            "url = \"http://k:s@h\"",
+            "url = \"https://user:hunter2@rpc.example/v1/KEY\"",
         );
-        assert!(toml::from_str::<Config>(&inline).is_err());
+        let c = config(&inline);
+        let endpoints = c.load_endpoints().unwrap_err();
+        // The secondary's file does not exist; only the primary is inline.
+        assert!(matches!(endpoints, ConfigError::UrlFile { .. }));
+        assert!(!format!("{c:?}").contains("hunter2"));
+
+        let bad = TWO.replace(
+            "url_file = \"/run/secrets/rpc-primary-url\"",
+            "url = \"ftp://user:hunter2@host\"",
+        );
+        let err = config(&bad).load_endpoints().unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidUrl { .. }));
+        assert!(!format!("{err} {err:?}").contains("hunter2"));
     }
 
     #[test]
@@ -299,8 +353,8 @@ mod tests {
         std::fs::write(&a, "https://user:hunter2@rpc.example/v1/KEY\n").unwrap();
         std::fs::write(&b, "http://127.0.0.1:8545").unwrap();
         let mut c = config(TWO);
-        c.endpoints[0].url_file = a;
-        c.endpoints[1].url_file = b;
+        c.endpoints[0].url_file = Some(a);
+        c.endpoints[1].url_file = Some(b);
 
         let endpoints = c.load_endpoints().unwrap();
         assert_eq!(&*endpoints[0].name, "primary");
@@ -320,18 +374,18 @@ mod tests {
         let bad = dir.path().join("bad");
         std::fs::write(&bad, "ftp://user:hunter2@host/secret").unwrap();
         let mut c = config(TWO);
-        c.endpoints[0].url_file = bad;
+        c.endpoints[0].url_file = Some(bad);
         let err = c.load_endpoints().unwrap_err();
         assert!(!format!("{err} {err:?}").contains("hunter2"));
 
-        c.endpoints[0].url_file = dir.path().join("missing");
+        c.endpoints[0].url_file = Some(dir.path().join("missing"));
         assert!(matches!(
             c.load_endpoints(),
             Err(ConfigError::UrlFile { .. })
         ));
         let empty = dir.path().join("empty");
         std::fs::write(&empty, "  \n").unwrap();
-        c.endpoints[0].url_file = empty;
+        c.endpoints[0].url_file = Some(empty);
         assert!(matches!(
             c.load_endpoints(),
             Err(ConfigError::UrlFileContents { .. })

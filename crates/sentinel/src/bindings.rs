@@ -23,12 +23,13 @@ pub mod oracle {
 
         #[derive(Debug)]
         contract SentinelOracle {
+            // Must match the deployed oracle's event exactly (topic0 0x1b858ca4…);
+            // a `daoFeeShare` variant has a different topic0 and is never matched.
             event NewRequest(
                 bytes32 indexed requestId,
                 address indexed sponsor,
                 uint96 fee,
                 uint96 bondTarget,
-                uint24 daoFeeShare,
                 uint96 slashAmount,
                 uint64 commitDeadline,
                 uint64 revealDeadline

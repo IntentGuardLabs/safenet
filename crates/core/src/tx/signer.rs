@@ -63,6 +63,8 @@ pub enum KeystoreError {
         .0.display()
     )]
     PasswordTooLarge(PathBuf),
+    #[error("keystore password environment variable {name}: {reason}")]
+    PasswordEnv { name: String, reason: &'static str },
     #[error("cannot read keystore file {}: {kind}", path.display())]
     KeystoreFile { path: PathBuf, kind: io::ErrorKind },
     #[error(
@@ -78,7 +80,7 @@ pub enum KeystoreError {
     )]
     TempCopy(PathBuf),
     #[error(
-        "could not decrypt keystore {}: incorrect password (or corrupted keystore); check that the password file has no trailing newline",
+        "could not decrypt keystore {}: incorrect password (or corrupted keystore); check that the password has no trailing newline",
         .0.display()
     )]
     IncorrectPassword(PathBuf),
@@ -122,7 +124,29 @@ impl Signer {
         expected: Address,
     ) -> Result<Self, KeystoreError> {
         let password = read_password(password_file)?;
+        Self::decrypt_keystore(keystore, password, expected)
+    }
 
+    /// Like [`Signer::from_keystore`], but reads the password from the
+    /// environment variable `password_env` instead of a file.
+    ///
+    /// The value is used verbatim (no trimming), must be non-empty valid UTF-8
+    /// and at most 4 KiB. Only the *name* of the variable is ever part of an
+    /// error; its value never is.
+    pub fn from_keystore_env(
+        keystore: &Path,
+        password_env: &str,
+        expected: Address,
+    ) -> Result<Self, KeystoreError> {
+        let password = read_password_env(password_env)?;
+        Self::decrypt_keystore(keystore, password, expected)
+    }
+
+    fn decrypt_keystore(
+        keystore: &Path,
+        password: Zeroizing<Vec<u8>>,
+        expected: Address,
+    ) -> Result<Self, KeystoreError> {
         let result = decrypt(keystore, &password);
         drop(password); // zeroizes
         let signer = result?;
@@ -341,6 +365,32 @@ fn read_password(path: &Path) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
     Ok(password)
 }
 
+/// Reads the keystore password from the environment variable `name`, verbatim.
+fn read_password_env(name: &str) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
+    let env_err = |reason| KeystoreError::PasswordEnv {
+        name: name.to_owned(),
+        reason,
+    };
+    // `std::env::var_os` panics on these; reject them as a configuration error.
+    if name.is_empty() || name.contains(['=', '\0']) {
+        return Err(env_err("is not a valid environment variable name"));
+    }
+    let value = std::env::var_os(name).ok_or_else(|| env_err("is not set"))?;
+    let password = Zeroizing::new(
+        value
+            .into_string()
+            .map_err(|_| env_err("is not valid UTF-8"))?
+            .into_bytes(),
+    );
+    if password.is_empty() {
+        return Err(env_err("is empty"));
+    }
+    if password.len() as u64 > MAX_PASSWORD_LEN {
+        return Err(env_err("is larger than 4096 bytes"));
+    }
+    Ok(password)
+}
+
 impl SignedTransaction {
     /// Compute the hash of the signed transaction.
     pub fn hash(&self) -> TxHash {
@@ -464,6 +514,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn loads_password_from_environment_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, address) = write_keystore(dir.path(), b"env pw");
+        // Unique names: tests run in parallel in one process.
+        // SAFETY: no other test reads or writes these variables.
+        unsafe {
+            std::env::set_var("SAFENET_TEST_KEYSTORE_PW_OK", "env pw");
+            std::env::set_var("SAFENET_TEST_KEYSTORE_PW_WRONG", "env pw\n");
+            std::env::set_var("SAFENET_TEST_KEYSTORE_PW_EMPTY", "");
+        }
+
+        let signer = Signer::from_keystore_env(&ks, "SAFENET_TEST_KEYSTORE_PW_OK", address);
+        assert_eq!(signer.unwrap().address(), address);
+
+        // A trailing newline is part of the password, as with password files.
+        let err =
+            Signer::from_keystore_env(&ks, "SAFENET_TEST_KEYSTORE_PW_WRONG", address).unwrap_err();
+        assert!(matches!(err, KeystoreError::IncorrectPassword(_)));
+
+        for name in [
+            "SAFENET_TEST_KEYSTORE_PW_EMPTY",
+            "SAFENET_TEST_KEYSTORE_PW_UNSET",
+            "",
+            "A=B",
+        ] {
+            let err = Signer::from_keystore_env(&ks, name, address).unwrap_err();
+            assert!(matches!(err, KeystoreError::PasswordEnv { .. }), "{name}");
+        }
     }
 
     #[test]
