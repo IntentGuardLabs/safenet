@@ -10,13 +10,21 @@ use alloy::{
     signers::{Signature, SignerSync as _, local::PrivateKeySigner},
 };
 use k256::{ecdsa::SigningKey, elliptic_curve::zeroize::Zeroize};
-use serde::{Deserialize, Deserializer, de};
-use std::fmt::{self, Debug, Formatter};
+use serde::{Deserialize, Deserializer};
+use std::{
+    fmt::{self, Debug, Formatter},
+    str::FromStr,
+};
 
 /// An error ECDSA signing a transaction.
 #[derive(Debug, thiserror::Error)]
 #[error("an error occurred signing an Ethereum transaction")]
 pub struct SigningError;
+
+/// An error parsing a [`Signer`] from a string.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid hex-encoded secp256k1 private key")]
+pub struct InvalidPrivateKey;
 
 /// A local account that signs and submits transactions onchain on behalf of a
 /// service.
@@ -141,15 +149,25 @@ impl SignedTransaction {
     }
 }
 
+impl FromStr for Signer {
+    type Err = InvalidPrivateKey;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Note that we intentionally discard the underlying errors, as hex
+        // decoding errors can include parts of the (secret) input.
+        let mut raw = B256::from_str(s).map_err(|_| InvalidPrivateKey)?;
+        let result = SigningKey::from_slice(raw.as_slice());
+        raw.0.zeroize();
+        result.map(Signer::new).map_err(|_| InvalidPrivateKey)
+    }
+}
+
 impl<'de> Deserialize<'de> for Signer {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let mut raw = B256::deserialize(deserializer)?;
-        let result = SigningKey::from_slice(raw.as_slice());
-        raw.0.zeroize();
-        result.map(Signer::new).map_err(de::Error::custom)
+        crate::serialization::from_str::deserialize(deserializer)
     }
 }
 
@@ -262,5 +280,18 @@ mod tests {
             }))
         };
         assert!(signer().sign_transaction(tx).is_err());
+    }
+
+    #[test]
+    fn parses_hex_private_keys() {
+        let private_key = keccak256("top secret key");
+        let account = Signer::from_str(&private_key.to_string()).unwrap();
+        assert_eq!(
+            account.address(),
+            Signer::new(SigningKey::from_slice(private_key.as_slice()).unwrap()).address()
+        );
+
+        assert!(Signer::from_str("0x1234").is_err());
+        assert!(Signer::from_str(&B256::ZERO.to_string()).is_err());
     }
 }
