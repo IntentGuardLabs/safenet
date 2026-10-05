@@ -163,8 +163,8 @@ deploy_safenet_7702_executor() {
 # signer, database, the `[validator]` table (consensus, blocks_per_epoch,
 # oracles, and one `[[validator.participants]]` entry per address in the
 # `participants_array_name` array), the `[transactions]` table's `executor`
-# if one is given, observability, and the `[index]` table's
-# `block_time`/`start_block`. Callers append any config specific to their own
+# if one is given, observability, and the `[index]` table's block timings
+# and `start_block`. Callers append any config specific to their own
 # test (e.g. `max_reorg_depth`) after calling this.
 print_validator_config_base() {
     local rpc_url=$1 signer=$2 database=$3 consensus_addr=$4 oracle_addr=$5
@@ -197,6 +197,9 @@ print_validator_config_base() {
     echo
     echo "[index]"
     echo "block_time = $block_time_ms"
+    # Anvil mines blocks locally, so there is no propagation to wait for.
+    echo "block_propagation_delay = 0"
+    echo "block_retry_delays = []"
     echo "start_block = 0"
 }
 
