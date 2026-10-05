@@ -123,6 +123,11 @@ test-integration-validator:
 test-integration-validator-reorg-nonce:
     ./scripts/run_validator_reorg_nonce_test.sh
 
+# Regression test: a transaction signing ceremony whose signature share round
+# times out must restart and get attested (Anvil + three validator instances).
+test-integration-validator-signing-restart:
+    ./scripts/run_validator_signing_restart_test.sh
+
 # Regression test: a signing ceremony whose nonce commitment round times out
 # must continue with the signers that revealed, instead of restarting (Anvil +
 # three validator instances, one of which is stopped before signing).

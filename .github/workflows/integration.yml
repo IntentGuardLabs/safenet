@@ -33,6 +33,11 @@ jobs:
             just-args: ""
             log-artifact: validator-integration-reorg-nonce-logs
 
+          - name: validator-signing-restart
+            just-target: test-integration-validator-signing-restart
+            just-args: ""
+            log-artifact: validator-integration-signing-restart-logs
+
           - name: validator-nonce-reveal-timeout
             just-target: test-integration-validator-nonce-reveal-timeout
             just-args: ""
