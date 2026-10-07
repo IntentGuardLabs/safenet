@@ -1,8 +1,9 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import viteReact from "@vitejs/plugin-react";
-import { defineConfig, loadEnv } from "vite";
+import { defineConfig, loadEnv, normalizePath } from "vite";
 
 const ETHEREUM_ADDRESS_REGEX = /^0x[0-9a-fA-F]{40}$/;
 
@@ -66,6 +67,31 @@ export default defineConfig(({ mode }) => {
 		}
 	}
 
+	// Legal links: VITE_<KEY>_URL is either a full URL or #anchor (linked as-is) or a path to an HTML
+	// fragment file, which is inlined at build time and served at the matching route (e.g. #/terms).
+	// The content is trusted operator input (like the env vars themselves), so it is not sanitized.
+	const legalFiles = {};
+	const loadLegalPage = (key, placeholder) => {
+		const value = env[`VITE_${key}_URL`];
+		if (!value) {
+			return { url: placeholder, html: "" };
+		}
+		if (value.startsWith("#") || URL.canParse(value)) {
+			return { url: value, html: "" };
+		}
+		const path = resolve(process.cwd(), value);
+		// Normalized so it matches the watcher's paths on Windows
+		legalFiles[key] = normalizePath(path);
+		try {
+			return { url: "", html: readFileSync(path, "utf8") };
+		} catch (error) {
+			throw new Error(`VITE_${key}_URL is neither a full URL nor a readable file: ${path} (${error.message})`);
+		}
+	};
+	const terms = loadLegalPage("TERMS", "#terms");
+	const privacy = loadLegalPage("PRIVACY", "#privacy");
+	const imprint = loadLegalPage("IMPRINT", "#imprint");
+
 	return {
 		base: basePath,
 		worker: {
@@ -87,6 +113,19 @@ export default defineConfig(({ mode }) => {
 				transformIndexHtml: (html) =>
 					html.replace(/%VITE_APP_URL%/g, env.VITE_APP_URL || process.env.CF_PAGES_URL || ""),
 			},
+			{
+				// Legal page content is inlined via `define`, so restart the dev server when a file changes.
+				name: "watch-legal-files",
+				configureServer: (server) => {
+					const files = Object.values(legalFiles);
+					server.watcher.add(files);
+					server.watcher.on("change", (file) => {
+						if (files.includes(normalizePath(file))) {
+							server.restart();
+						}
+					});
+				},
+			},
 		],
 		test: {
 			globals: true,
@@ -102,9 +141,13 @@ export default defineConfig(({ mode }) => {
 			__BASE_PATH__: JSON.stringify(basePath),
 			// Link URLs — configurable per deployment, with sensible defaults
 			__DOCS_URL__: JSON.stringify(env.VITE_DOCS_URL || "https://docs.safefoundation.org/safenet"),
-			__TERMS_URL__: JSON.stringify(env.VITE_TERMS_URL || "#tos"),
-			__PRIVACY_URL__: JSON.stringify(env.VITE_PRIVACY_URL || "#privacy"),
-			__IMPRINT_URL__: JSON.stringify(env.VITE_IMPRINT_URL || "#imprint"),
+			__TERMS_URL__: JSON.stringify(terms.url),
+			__PRIVACY_URL__: JSON.stringify(privacy.url),
+			__IMPRINT_URL__: JSON.stringify(imprint.url),
+			// Inlined legal page HTML — empty unless VITE_<KEY>_URL is a file path
+			__TERMS_HTML__: JSON.stringify(terms.html),
+			__PRIVACY_HTML__: JSON.stringify(privacy.html),
+			__IMPRINT_HTML__: JSON.stringify(imprint.html),
 			// Default explorer settings — configurable per deployment, users can still override in the UI
 			__DEFAULT_CONSENSUS__: JSON.stringify(env.VITE_DEFAULT_CONSENSUS || "0xc855761D619f6002923507cE68B84d7689C2aa96"),
 			__DEFAULT_RPC__: JSON.stringify(env.VITE_DEFAULT_RPC || "https://rpc.gnosischain.com"),
