@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Dedicated unprivileged numeric identity (no login shell, no home directory).
 # The image never contains keys, passwords or keystores: those are mounted at
-# runtime (see `deploy/sentinel/compose.prod.yaml`).
+# runtime (see `server/sentinel/compose.prod.yaml` in the infra repo).
 #
 # The data directory is the only place the sentinel writes (its SQLite
 # database), so the rest of the root filesystem can be mounted `read_only`.
