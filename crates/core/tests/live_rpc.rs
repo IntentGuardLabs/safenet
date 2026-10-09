@@ -19,7 +19,7 @@ use alloy::{
 use safenet_core::{
     index::{
         BlockUpdate, Config as IndexConfig, Update, Watcher,
-        blocks::{self, BlockTime},
+        blocks::{self, Timing},
         events,
     },
     provider::{ConnectError, Provider},
@@ -219,7 +219,7 @@ impl Live {
 fn index_config(start_block: u64) -> IndexConfig {
     IndexConfig {
         blocks: blocks::Config {
-            block_time: BlockTime::Millis(12_000),
+            block_time: Timing::Millis(12_000),
             max_reorg_depth: 2,
             start_block: Some(start_block),
             strict: true,
@@ -344,7 +344,7 @@ async fn per_block_scan_with_real_logs() {
     assert!(all.iter().all(|l| l.address == WETH));
     assert!(
         all.windows(2)
-            .all(|w| (w[0].block, w[0].index) < (w[1].block, w[1].index))
+            .all(|w| (w[0].block.number, w[0].index) < (w[1].block.number, w[1].index))
     );
     // Per-block exact-hash queries, restricted by address+topics; no range queries.
     let pool = provider.pool().unwrap();

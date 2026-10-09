@@ -7,6 +7,7 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -39,6 +40,19 @@ impl Debug for SecretUrl {
 impl Display for SecretUrl {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.write_str("<redacted>")
+    }
+}
+
+/// An error parsing a [`SecretUrl`]. It never contains the value.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid RPC URL (value not shown)")]
+pub struct InvalidSecretUrl;
+
+impl FromStr for SecretUrl {
+    type Err = InvalidSecretUrl;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Url::parse(s).map(Self).map_err(|_| InvalidSecretUrl)
     }
 }
 

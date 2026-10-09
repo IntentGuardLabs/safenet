@@ -1,6 +1,7 @@
 use alloy::primitives::Address;
 use safenet_core::{
-    driver, observability, rpc,
+    config, driver, observability, rpc,
+    serialization::from_str_with_env,
     tx::{KeystoreError, Signer},
 };
 use serde::{
@@ -12,24 +13,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
 };
-use tokio::{fs, io};
 use url::Url;
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    /// A TOML error, reduced to its message and location. `toml`'s own
-    /// `Display` quotes the offending source line, which for a legacy inline
-    /// `signer = "0x..."` would print the private key.
-    #[error("invalid configuration {}: {message} (line {line}, column {column})", file.display())]
-    Parse {
-        file: PathBuf,
-        message: String,
-        line: usize,
-        column: usize,
-    },
-}
 
 /// The RPC section: an ordered list of endpoints with sticky-primary failover
 /// (`[rpc]` + `[[rpc.endpoints]]`), or the deprecated single `rpc = "<url>"`.
@@ -90,7 +74,9 @@ impl<'de> Deserialize<'de> for RpcConfig {
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                rpc::SecretUrl::deserialize(de::value::StrDeserializer::new(v))
+                // Like every other secret-bearing value, the deprecated inline
+                // URL may reference environment variables as `${NAME}`.
+                from_str_with_env::deserialize(de::value::StrDeserializer::new(v))
                     .map(RpcConfig::Legacy)
             }
 
@@ -199,7 +185,8 @@ impl<'de> Deserialize<'de> for SignerConfig {
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Signer::deserialize(de::value::StrDeserializer::new(v)).map(SignerConfig::Legacy)
+                from_str_with_env::deserialize(de::value::StrDeserializer::new(v))
+                    .map(SignerConfig::Legacy)
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
@@ -226,7 +213,7 @@ pub struct Config {
     /// How to obtain the signer used to sign and submit transactions onchain.
     pub signer: SignerConfig,
     /// The database URL backing persistent state and transaction storage.
-    #[serde(with = "safenet_core::serialization::from_str")]
+    #[serde(with = "safenet_core::serialization::from_str_with_env")]
     pub database: SqliteConnectOptions,
     /// The `SentinelOracle` contract watched and voted/committed on.
     pub oracle: Address,
@@ -255,29 +242,18 @@ pub struct Config {
 pub struct SentinelConfig {
     /// The ERC-20 fee token approved for bonds.
     pub fee_token: Address,
-    /// The number of blocks a `Preparing` request is kept alive for before
-    /// being cleaned up.
+    /// The number of blocks a request without an onchain commit deadline is
+    /// kept alive for before being cleaned up.
     pub voting_window: u64,
     /// Base URL of the transaction-verification engine used by this sentinel.
     pub engine: Url,
 }
 
 impl Config {
-    pub async fn load(file: &Path) -> Result<Self, Error> {
-        let contents = fs::read_to_string(file).await?;
-        let mut config = toml::from_str::<Self>(&contents).map_err(|err| {
-            let (line, column) = err.span().map_or((0, 0), |span| {
-                let before = &contents[..span.start];
-                let line = before.matches('\n').count() + 1;
-                (line, before.rsplit('\n').next().map_or(0, str::len) + 1)
-            });
-            Error::Parse {
-                file: file.to_owned(),
-                message: err.message().to_owned(),
-                line,
-                column,
-            }
-        })?;
+    pub async fn load(file: &Path) -> Result<Self, config::Error> {
+        // `config::load` reports parse errors by position only, never quoting
+        // the file, which may hold a legacy inline key or credentialed URL.
+        let mut config = config::load::<Self>(file).await?;
         // Secret paths are relative to the configuration file, not the
         // process's working directory. Nothing is canonicalized: that would
         // need the files to exist, and the files are only ever read.

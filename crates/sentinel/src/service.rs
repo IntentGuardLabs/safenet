@@ -10,6 +10,7 @@ use crate::{
     hashing::{RevealSalt as _, commit_hash, oracle_tx_proposal_hash},
     metrics::ResolvedOutcome,
     state::{Request, SentinelRequestState as RequestState, State},
+    verdicts::VerdictStore,
 };
 use alloy::{
     primitives::{Address, B256, U256},
@@ -37,6 +38,9 @@ pub struct SentinelService {
     engine: EngineClient,
     /// Maximum time the sentinel engine has to answer a security check.
     engine_timeout: Duration,
+    /// Records engine verdicts so a replayed check reuses the one a
+    /// commitment was built from.
+    verdicts: VerdictStore,
 }
 
 /// Advances the request FSM in response to `SentinelOracle`/`Consensus`
@@ -78,6 +82,7 @@ impl SentinelService {
         voting_window: u64,
         engine: EngineClient,
         engine_timeout: Duration,
+        verdicts: VerdictStore,
     ) -> Self {
         Self {
             oracle,
@@ -88,6 +93,7 @@ impl SentinelService {
             voting_window,
             engine,
             engine_timeout,
+            verdicts,
         }
     }
 }
@@ -95,11 +101,13 @@ impl SentinelService {
 impl SentinelTransition {
     /// Starts tracking a newly proposed oracle transaction and requests a
     /// verdict from the configured sentinel engine via
-    /// [`effect::Effect::EngineCheck`].
+    /// [`effect::Effect::EngineCheck`]. `block_timestamp` is the timestamp of
+    /// the consensus-chain block the proposal was made in.
     fn handle_oracle_transaction_proposed(
         &self,
         mut state: State,
         block: u64,
+        block_timestamp: u64,
         event: Consensus::TransactionProposed,
     ) -> (State, Commands<State, Self>) {
         if event.oracle != self.oracle {
@@ -139,6 +147,7 @@ impl SentinelTransition {
             vec![Command::Effect(effect::Effect::EngineCheck {
                 request_id,
                 transaction: event.transaction,
+                proposal_timestamp: block_timestamp,
                 block,
             })],
         )
@@ -385,8 +394,9 @@ impl SentinelTransition {
     }
 
     /// Drops requests we never got to commit on in time, reveals (or drops)
-    /// requests past their commit deadline, and finalizes requests past
-    /// their reveal deadline.
+    /// requests past their commit deadline, finalizes requests past their
+    /// reveal deadline, and times out and claims disputes past their
+    /// arbitration deadline.
     fn handle_block_advance(&self, mut state: State, block: u64) -> (State, Commands<State, Self>) {
         let mut actions = Vec::new();
 
@@ -464,7 +474,37 @@ impl SentinelTransition {
                 }
             }
             RequestState::WaitingForOutcome { .. } => true,
-            RequestState::WaitingForDisputeResolution { .. } => true,
+            RequestState::WaitingForDisputeResolution {
+                arbitration_deadline,
+                ..
+            } => {
+                // `<=` rather than `!= arbitration_deadline + 1`: warp-mode
+                // catch-up doesn't deliver a `NewBlock` for every block, so
+                // the first block past the deadline may never be observed.
+                if block <= *arbitration_deadline {
+                    return true;
+                }
+                // Our `timeoutArbitration()` reverts if another sentinel's
+                // (or a late ruling) lands first, but the `claim()` queued
+                // behind it succeeds either way, since the request is no
+                // longer `FROZEN` by then. So there is nothing left to wait
+                // on, and the request is dropped; the `ArbitrationTimedOut`
+                // that follows is ignored as untracked.
+                crate::metrics::requests_resolved_total(ResolvedOutcome::Timeout).increment(1);
+                actions.extend([
+                    SentinelAction {
+                        kind: SentinelActionKind::TimeoutArbitration { id: *id },
+                        expires_at: None,
+                    }
+                    .into(),
+                    SentinelAction {
+                        kind: SentinelActionKind::Claim { id: *id },
+                        expires_at: None,
+                    }
+                    .into(),
+                ]);
+                false
+            }
         });
 
         (state, actions)
@@ -490,6 +530,7 @@ impl SentinelTransition {
             Some(RequestState::WaitingForDisputeResolution {
                 approve,
                 slash_amount,
+                ..
             }) => (approve, slash_amount),
             Some(entry) => {
                 tracing::warn!(
@@ -708,7 +749,9 @@ impl SentinelTransition {
     /// `finalize()` found both an `approve` and a `deny` side established
     /// onchain -- expected only from `WaitingForOutcome`, which is where it
     /// carries `approve`/`slash_amount` forward from. The request now waits
-    /// for the arbitrator's ruling; see [`Self::handle_resolved`].
+    /// for the arbitrator's ruling (see [`Self::handle_resolved`]) until the
+    /// event's `deadline`, after which [`Self::handle_block_advance`] times
+    /// the arbitration out and claims itself.
     ///
     /// A tracked request found in any *other* state here is unexpected, but
     /// the dispute is real onchain regardless of what we thought was
@@ -745,6 +788,7 @@ impl SentinelTransition {
                 RequestState::WaitingForDisputeResolution {
                     approve,
                     slash_amount,
+                    arbitration_deadline: event.deadline,
                 },
             );
         }
@@ -881,6 +925,14 @@ impl SentinelEncoder {
                     .into(),
                 gas: 250_000,
             },
+            SentinelActionKind::TimeoutArbitration { id } => Transaction {
+                to: self.oracle,
+                value: U256::ZERO,
+                data: SentinelOracle::timeoutArbitrationCall { requestId: id }
+                    .abi_encode()
+                    .into(),
+                gas: 250_000,
+            },
         }
     }
 }
@@ -899,11 +951,16 @@ impl StateTransition<State> for SentinelTransition {
         match message {
             Message::NewBlock(block) => self.handle_block_advance(state, block),
             Message::Event(event) => {
-                let block = event.block;
+                let (block, block_timestamp) = (event.block.number, event.block.timestamp);
                 match event.data {
                     SentinelEvents::Consensus(Consensus::ConsensusEvents::TransactionProposed(
                         event,
-                    )) => self.handle_oracle_transaction_proposed(state, block, event),
+                    )) => self.handle_oracle_transaction_proposed(
+                        state,
+                        block,
+                        block_timestamp,
+                        event,
+                    ),
                     SentinelEvents::Oracle(SentinelOracle::SentinelOracleEvents::NewRequest(
                         event,
                     )) => self.handle_new_request(state, event),
@@ -971,6 +1028,7 @@ impl Service for SentinelService {
             voting_window,
             engine,
             engine_timeout,
+            verdicts,
         } = self;
         (
             SentinelTransition {
@@ -980,7 +1038,7 @@ impl Service for SentinelService {
                 chain_id,
                 voting_window,
             },
-            effect::Handler::new(engine, engine_timeout),
+            effect::Handler::new(engine, engine_timeout, verdicts),
             SentinelEncoder { oracle, fee_token },
         )
     }
@@ -1005,17 +1063,15 @@ mod tests {
         primitives::{Bytes, Uint, address, aliases::U96, keccak256},
         signers::k256::ecdsa::SigningKey,
     };
-    use safenet_core::index::EventLog;
+    use safenet_core::index::{EventBlock, EventLog};
 
     const ORACLE: Address = address!("1111111111111111111111111111111111111111");
-    const FEE_TOKEN: Address = address!("2222222222222222222222222222222222222222");
     const CONSENSUS: Address = address!("3333333333333333333333333333333333333333");
     const SAFE: Address = address!("4444444444444444444444444444444444444444");
     const TO: Address = address!("5555555555555555555555555555555555555555");
     const OTHER: Address = address!("8888888888888888888888888888888888888888");
     const CHAIN_ID: u64 = 1;
     const VOTING_WINDOW: u64 = 10;
-    const ENGINE_TIMEOUT: Duration = Duration::from_millis(7_500);
     /// The reason attached to an engine-approved transaction.
     const REASON: &str = "";
 
@@ -1027,27 +1083,17 @@ mod tests {
         self_signer().address()
     }
 
-    fn service() -> SentinelService {
+    fn transition() -> SentinelTransition {
         // These flow tests drive `Message::Resume` themselves (see
         // `resolve_engine_check`) rather than through the `Handler`'s real
-        // `Effect::EngineCheck` resolution, so the configured engine is
-        // never invoked.
-        SentinelService::new(
-            ORACLE,
-            FEE_TOKEN,
-            CONSENSUS,
-            self_signer(),
-            U256::from(CHAIN_ID),
-            VOTING_WINDOW,
-            // Configure an engine for an invalid URL, all checks come back
-            // as `Unknown`.
-            EngineClient::new("http://127.0.0.1:1".parse().unwrap()).unwrap(),
-            ENGINE_TIMEOUT,
-        )
-    }
-
-    fn transition() -> SentinelTransition {
-        service().components().0
+        // `Effect::EngineCheck` resolution, so no engine is configured.
+        SentinelTransition {
+            oracle: ORACLE,
+            consensus: CONSENSUS,
+            signer: self_signer(),
+            chain_id: U256::from(CHAIN_ID),
+            voting_window: VOTING_WINDOW,
+        }
     }
 
     fn safe_tx(to: Address) -> SafeTransaction {
@@ -1100,6 +1146,7 @@ mod tests {
         Command::Effect(effect::Effect::EngineCheck {
             request_id: id,
             transaction: safe_tx(to),
+            proposal_timestamp: block_timestamp(block),
             block,
         })
     }
@@ -1239,9 +1286,16 @@ mod tests {
         ))
     }
 
+    fn block_timestamp(block: u64) -> u64 {
+        1_700_000_000 + block * 12
+    }
+
     fn log(block: u64, data: SentinelEvents) -> EventLog<SentinelEvents> {
         EventLog {
-            block,
+            block: EventBlock {
+                number: block,
+                timestamp: block_timestamp(block),
+            },
             index: 0,
             address: Address::ZERO,
             data,
@@ -1630,6 +1684,7 @@ mod tests {
             RequestState::WaitingForDisputeResolution {
                 approve: true,
                 slash_amount: U96::from(500),
+                arbitration_deadline: 60,
             }
         );
 
