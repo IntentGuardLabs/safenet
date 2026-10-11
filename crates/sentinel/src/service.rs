@@ -141,6 +141,13 @@ impl SentinelTransition {
             },
         );
         crate::metrics::requests_proposed_total().increment(1);
+        tracing::info!(
+            %request_id,
+            block,
+            block_timestamp,
+            engine_deadline = deadline,
+            "request discovered; engine check started"
+        );
 
         (
             state,
@@ -179,6 +186,12 @@ impl SentinelTransition {
             }
         };
 
+        tracing::info!(
+            %request_id,
+            ?outcome,
+            request_open = request.is_some(),
+            "engine verdict received"
+        );
         let (approve, reason) = match outcome {
             CheckOutcome::Approved => (true, String::new()),
             CheckOutcome::Denied(rule) => (false, rule.to_string()),
@@ -218,6 +231,13 @@ impl SentinelTransition {
             commit_deadline,
             reveal_deadline,
         } = request;
+        tracing::info!(
+            %request_id,
+            approve,
+            commit_deadline,
+            reveal_deadline,
+            "commit_vote: queueing token approval and commit"
+        );
         let salt = self.signer.reveal_salt(request_id);
         let hash = commit_hash(self.signer.address(), request_id, approve, salt, &reason);
         state.0.insert(
@@ -266,6 +286,13 @@ impl SentinelTransition {
             commit_deadline: event.commitDeadline,
             reveal_deadline: event.revealDeadline,
         };
+        tracing::info!(
+            %request_id,
+            commit_deadline = request.commit_deadline,
+            reveal_deadline = request.reveal_deadline,
+            tracked_state = state.0.get(&request_id).map(RequestState::name),
+            "oracle request opened"
+        );
         match state.0.remove(&request_id) {
             Some(RequestState::WaitingForRequest {
                 approve, reason, ..
@@ -402,12 +429,33 @@ impl SentinelTransition {
 
         state.0.retain(|id, entry| match entry {
             RequestState::WaitingForEngineCheck { deadline, request } => {
-                block
-                    <= request
-                        .as_ref()
-                        .map_or(*deadline, |request| request.commit_deadline)
+                let limit = request
+                    .as_ref()
+                    .map_or(*deadline, |request| request.commit_deadline);
+                let keep = block <= limit;
+                if !keep {
+                    tracing::warn!(
+                        request_id = %id,
+                        block,
+                        limit,
+                        request_open = request.is_some(),
+                        "dropping request: no engine verdict applied before the deadline"
+                    );
+                }
+                keep
             }
-            RequestState::WaitingForRequest { deadline, .. } => block <= *deadline,
+            RequestState::WaitingForRequest { deadline, .. } => {
+                let keep = block <= *deadline;
+                if !keep {
+                    tracing::warn!(
+                        request_id = %id,
+                        block,
+                        deadline = *deadline,
+                        "dropping request: engine verdict ready but the oracle request never opened"
+                    );
+                }
+                keep
+            }
             RequestState::CollectingCommitments {
                 approve,
                 reason,
@@ -423,6 +471,13 @@ impl SentinelTransition {
                 // Our own commit never landed onchain, so revealing would
                 // just revert; drop the request instead.
                 if !*self_committed {
+                    tracing::warn!(
+                        request_id = %id,
+                        block,
+                        commit_deadline = *commit_deadline,
+                        committed_count = *committed_count,
+                        "dropping request: our commit never landed onchain"
+                    );
                     return false;
                 }
                 let approve = *approve;

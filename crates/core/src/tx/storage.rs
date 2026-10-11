@@ -257,6 +257,18 @@ impl TransactionStorage {
         Ok(())
     }
 
+    /// Returns `(id, expires_at)` of queued transactions that were never
+    /// assigned a nonce and have expired by `block`. Read-only; diagnostics.
+    pub async fn expired_unsubmitted(&self, block: u64) -> Result<Vec<(i64, i64)>, Error> {
+        Ok(sqlx::query_as::<_, (i64, i64)>(
+            "SELECT id, expires_at FROM transactions
+             WHERE nonce IS NULL AND expires_at IS NOT NULL AND expires_at <= ?",
+        )
+        .bind(i64::try_from(block)?)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Returns the number of outstanding transactions at `block`: those not yet
     /// executed that are either in flight or queued and not yet expired.
     ///

@@ -336,6 +336,11 @@ where
         }
 
         if !transactions.is_empty() {
+            tracing::debug!(
+                count = transactions.len(),
+                latest = self.watcher.block_status().latest,
+                "queueing transactions from state machine actions"
+            );
             let result = self.transactions.queue(transactions).await;
             if let Err(err) = tx::lift_intermittent_error(result)? {
                 tracing::warn!(

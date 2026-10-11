@@ -33,6 +33,7 @@ use alloy::{
     transports::TransportError,
 };
 use sqlx::sqlite::SqlitePool;
+use std::collections::HashSet;
 
 /// Error produced by the [`TransactionQueue`].
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +93,8 @@ pub struct TransactionQueue {
     block_status: Option<BlockStatus>,
     account_cache: Option<AccountStatus>,
     fee_cache: Option<Eip1559Estimation>,
+    /// Ids of expired queued transactions already reported in the logs.
+    reported_expired: HashSet<i64>,
 }
 
 impl TransactionQueue {
@@ -143,6 +146,7 @@ impl TransactionQueue {
             block_status: None,
             account_cache: None,
             fee_cache: None,
+            reported_expired: HashSet::new(),
         })
     }
 
@@ -154,9 +158,17 @@ impl TransactionQueue {
         &mut self,
         transactions: impl IntoIterator<Item = (Transaction, Option<u64>)>,
     ) -> Result<(), Error> {
+        let transactions: Vec<_> = transactions.into_iter().collect();
+        tracing::info!(
+            count = transactions.len(),
+            expires_at = ?transactions.iter().map(|(_, expires_at)| *expires_at).collect::<Vec<_>>(),
+            latest = self.block_status.map(|status| status.latest),
+            "transactions queued"
+        );
         self.storage.enqueue(transactions).await?;
         if let Some(status) = self.block_status {
             self.submit_pending(status.latest).await?;
+            self.report_expired(status.latest).await;
         }
         Ok(())
     }
@@ -223,8 +235,27 @@ impl TransactionQueue {
             self.resubmit_stale(status.latest).await?;
             self.submit_pending(status.latest).await?;
         }
+        self.report_expired(status.latest).await;
 
         Ok(())
+    }
+
+    /// Logs, once each, queued transactions that expired before they could be
+    /// submitted. Diagnostics only: failures to look them up are ignored.
+    async fn report_expired(&mut self, latest: u64) {
+        let Ok(expired) = self.storage.expired_unsubmitted(latest).await else {
+            return;
+        };
+        for (id, expires_at) in expired {
+            if self.reported_expired.insert(id) {
+                tracing::warn!(
+                    queue_id = id,
+                    expires_at,
+                    latest,
+                    "queued transaction expired before it was submitted"
+                );
+            }
+        }
     }
 
     /// Submits queued transactions while fewer than
@@ -330,7 +361,15 @@ impl TransactionQueue {
             "submitting transaction"
         );
         match self.provider.send_raw_transaction(signed.as_raw()).await {
-            Ok(_) => self.storage.record_submission(submission).await?,
+            Ok(_) => {
+                tracing::info!(
+                    nonce = submission.nonce,
+                    block,
+                    hash = %signed.hash(),
+                    "transaction submitted"
+                );
+                self.storage.record_submission(submission).await?
+            }
             // An underpriced rejection confirms that the attempted fees were
             // insufficient. Record them as the new floor, but without a block
             // so that the transaction is retried with bumped fees on the next
