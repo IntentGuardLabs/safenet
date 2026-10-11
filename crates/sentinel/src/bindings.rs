@@ -23,13 +23,12 @@ pub mod oracle {
 
         #[derive(Debug)]
         contract SentinelOracle {
-            // Must match the deployed oracle's event exactly (topic0 0x1b858ca4…);
-            // a `daoFeeShare` variant has a different topic0 and is never matched.
             event NewRequest(
                 bytes32 indexed requestId,
                 address indexed sponsor,
                 uint96 fee,
                 uint96 bondTarget,
+                uint24 daoFeeShare,
                 uint96 slashAmount,
                 uint64 commitDeadline,
                 uint64 revealDeadline
@@ -173,5 +172,59 @@ watcher_events! {
     pub enum SentinelEvents {
         Oracle(oracle::SentinelOracle::SentinelOracleEvents),
         Consensus(consensus::Consensus::ConsensusEvents),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{consensus::Consensus, oracle::SentinelOracle};
+    use alloy::{primitives::b256, sol_types::SolEvent};
+
+    /// The event topics the sentinel filters on must equal the topics the deployed contracts
+    /// emit, or the watcher silently never sees those events: an event whose signature differs
+    /// (for example a missing `daoFeeShare` on `NewRequest`) is excluded by the log filter with
+    /// no error, and the sentinel then never opens the request it holds a verdict for.
+    ///
+    /// The expected hashes are the keccak256 of the signatures in `contracts/src` and were
+    /// cross-checked against the topics emitted by the deployed Gnosis testnet contracts.
+    /// Changing one of these means the contract's event changed: update the binding with it.
+    #[test]
+    fn event_topics_match_the_deployed_contracts() {
+        assert_eq!(
+            SentinelOracle::NewRequest::SIGNATURE_HASH,
+            b256!("8ec61272960f97d43d7f8f85ed630aa512818577f3d1e548e7627b06dbbbda86"),
+        );
+        assert_eq!(
+            SentinelOracle::Committed::SIGNATURE_HASH,
+            b256!("45acbf2626c7d2bd97eb2142a43d392e8f3364c9e140b3d022446155491819d6"),
+        );
+        assert_eq!(
+            SentinelOracle::Revealed::SIGNATURE_HASH,
+            b256!("d2cdead965dbd376703d9a79240f31f1228055ab42384b68353332fcd2af939a"),
+        );
+        assert_eq!(
+            SentinelOracle::Claimed::SIGNATURE_HASH,
+            b256!("006f1d9d8ec7f5d7941e2363561ba0f1da911361b351d007f9b448d557e39e86"),
+        );
+        assert_eq!(
+            SentinelOracle::RequestTimedOut::SIGNATURE_HASH,
+            b256!("f1ca1e9147be737b04a2b018a79405f687a97de8dd8a2559bbe62357343af414"),
+        );
+        assert_eq!(
+            SentinelOracle::OracleResult::SIGNATURE_HASH,
+            b256!("7843c453c4f7442b00e1bf3873e741f18f3447e18a13304c58bef95efd311757"),
+        );
+        assert_eq!(
+            SentinelOracle::DisputeTriggered::SIGNATURE_HASH,
+            b256!("86e8b85731e4787f033d85108356db1e068dea243be32d422e6dc5681ff49cc1"),
+        );
+        assert_eq!(
+            SentinelOracle::ArbitrationTimedOut::SIGNATURE_HASH,
+            b256!("5f19817b3ad988fdb5a7fb3f657a755e58a107bf47431574b7c516a6dc1551e6"),
+        );
+        assert_eq!(
+            Consensus::TransactionProposed::SIGNATURE_HASH,
+            b256!("47d867ce4d91d0487fa4d2ac80b13e7466ce53dd018a8eef564fc60c92b53d03"),
+        );
     }
 }
