@@ -492,6 +492,8 @@ pub struct Initializer {
     pub genesis_group_id: B256,
     /// The number of blocks per epoch.
     pub blocks_per_epoch: NonZeroU64,
+    /// The block the indexer back-fills from on a fresh start, if configured.
+    pub start_block: Option<u64>,
 }
 
 /// An error initializing the validator state.
@@ -501,16 +503,76 @@ pub enum InitializerError {
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
     /// The configured genesis group does not match the onchain one.
-    #[error("configured genesis group {configured} does not match onchain genesis group {onchain}")]
+    #[error(
+        "configured genesis group {configured} does not match onchain genesis \
+         group {onchain}"
+    )]
     GenesisGroupMismatch {
         /// The configured genesis group ID.
         configured: B256,
         /// The onchain genesis group ID.
         onchain: B256,
     },
+    /// The genesis key generation already started, but its events will not be
+    /// replayed without a configured start block.
+    #[error(
+        "genesis key generation is already underway; configure the index \
+         `start_block` to replay it"
+    )]
+    GenesisInProgress,
+    /// The genesis key generation started before the configured start block,
+    /// so its events will not be replayed.
+    #[error(
+        "genesis key generation started before the index `start_block` \
+         {start_block}; configure an earlier one to replay it"
+    )]
+    GenesisStartedBeforeStartBlock {
+        /// The configured start block.
+        start_block: u64,
+    },
 }
 
 impl Initializer {
+    /// Returns whether the genesis group's key generation has started as of
+    /// `block`.
+    async fn genesis_started(&self, block: u64) -> Result<bool, alloy::contract::Error> {
+        // Use the group parameters as a proxy for whether or not the key
+        // generation has started. The count and threshold are non-zero if and
+        // only if `keyGen(...)` has been called for that group.
+        let parameters = Coordinator::new(self.coordinator, &self.provider)
+            .groupParameters(self.genesis_group_id)
+            .block(block.into())
+            .call()
+            .await?;
+        Ok(parameters.count != 0)
+    }
+
+    /// Checks that the genesis key generation started at or after
+    /// `start_block`, so that its events are replayed by the indexer.
+    ///
+    /// This requires historical state, which the node may not have (for
+    /// example, if it is not an archive node). In that case, the check is
+    /// skipped with a warning.
+    async fn check_can_replay_genesis(&self, start_block: u64) -> Result<(), InitializerError> {
+        let Some(before) = start_block.checked_sub(1) else {
+            return Ok(());
+        };
+        match self.genesis_started(before).await {
+            // The coordinator was not yet deployed, so genesis could not have
+            // started either.
+            Ok(false) | Err(alloy::contract::Error::ZeroData(..)) => Ok(()),
+            Ok(true) => Err(InitializerError::GenesisStartedBeforeStartBlock { start_block }),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    start_block,
+                    "unable to verify that the genesis key generation started after the start block"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Returns whether the genesis group's key generation has completed as of
     /// `block`.
     async fn genesis_completed(&self, block: u64) -> Result<bool, alloy::contract::Error> {
@@ -569,6 +631,17 @@ impl StateInitializer<State> for Initializer {
             // There is already a staged epoch, wait for it to roll over.
             RolloverState::EpochStaged { next_epoch }
         } else if active_epoch == EpochId::Genesis && !self.genesis_completed(block).await? {
+            // Genesis must not be skipped while it has not completed, as it
+            // does not follow the epoch clock: skipping it would start a
+            // rollover key generation that no one else takes part in. If it
+            // already started, its `KeyGen` event is only observed when the
+            // indexer replays it, which requires a start block before it.
+            if self.genesis_started(block).await? {
+                match self.start_block {
+                    Some(start_block) => self.check_can_replay_genesis(start_block).await?,
+                    None => return Err(InitializerError::GenesisInProgress),
+                }
+            }
             RolloverState::WaitingForGenesis
         } else {
             // Skip the epoch whose key generation is already underway
