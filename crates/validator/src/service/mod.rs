@@ -18,34 +18,37 @@ use crate::{
     state::{self, State},
 };
 use alloy::primitives::Address;
-use safenet_core::{driver::Service, watcher_events};
+use safenet_core::{driver::Service, provider::Provider, watcher_events};
 use sqlx::SqlitePool;
 
 /// The validator service bundle: the state transition, effect handler and
 /// action encoder that the driver runs.
 pub struct ValidatorService {
+    /// The Ethereum RPC provider for the service.
+    provider: Provider,
     /// The account of the running validator.
     account: Address,
     /// The secret store containing keygen coeffecients and signing nonces.
     secrets: SecretStore,
     /// The genesis participant set.
     genesis: ParticipantSet,
-    /// The consensus signing domain.
-    consensus: ConsensusDomain,
     /// The FROST coordinator contract to submit protocol actions to.
     coordinator: Address,
     /// The validator configuration.
     config: ValidatorConfig,
+    /// The block the indexer back-fills from on a fresh start, if configured.
+    start_block: Option<u64>,
 }
 
 impl ValidatorService {
     /// Creates the validator service from its machine configuration.
     pub async fn new(
-        chain_id: u64,
+        provider: Provider,
         account: Address,
         pool: SqlitePool,
         coordinator: Address,
         config: ValidatorConfig,
+        start_block: Option<u64>,
     ) -> Result<Self, Error> {
         let secrets = SecretStore::new(pool).await?;
         let genesis = group::participants_set(
@@ -55,15 +58,16 @@ impl ValidatorService {
             },
         )
         .ok_or(Error::InvalidValidators)?;
-        let consensus = ConsensusDomain::new(chain_id, config.consensus);
+        tracing::info!(genesis_group_id = %genesis.group().id(), "configured genesis group id");
 
         Ok(Self {
+            provider,
             account,
             secrets,
             genesis,
-            consensus,
             coordinator,
             config,
+            start_block,
         })
     }
 }
@@ -87,25 +91,45 @@ impl Service for ValidatorService {
     type Resume = Resume;
 
     type Transition = state::Transition;
+    type Initializer = state::Initializer;
     type Effects = effect::Handler;
     type Actions = action::Encoder;
 
-    fn components(self) -> (Self::Transition, Self::Effects, Self::Actions) {
+    fn components(
+        self,
+    ) -> (
+        Self::Transition,
+        Self::Initializer,
+        Self::Effects,
+        Self::Actions,
+    ) {
         let ValidatorService {
+            provider,
             account,
             genesis,
             secrets,
-            consensus,
             coordinator,
             config,
+            start_block,
         } = self;
         let consensus_address = config.consensus;
+        let blocks_per_epoch = config.blocks_per_epoch;
+        let genesis_group_id = genesis.group().id();
+        let consensus = ConsensusDomain::new(provider.chain_id(), consensus_address);
         (
             state::Transition {
                 account,
                 genesis,
                 consensus,
                 config,
+            },
+            state::Initializer {
+                provider,
+                consensus: consensus_address,
+                coordinator,
+                genesis_group_id,
+                blocks_per_epoch,
+                start_block,
             },
             effect::Handler::new(account, secrets),
             action::Encoder {

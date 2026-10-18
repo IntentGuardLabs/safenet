@@ -54,6 +54,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/safe-research/safenet-${{ matrix.image }}${{ matrix.suffix }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            # create network tags on new releases
+            type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/v0.1.') }}
+            type=raw,value=aegis,enable=${{ startsWith(github.ref, 'refs/tags/v0.2.') }}
           flavor: |
             latest=false
 

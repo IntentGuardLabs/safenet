@@ -9,7 +9,7 @@ use crate::{
     bindings::{Consensus, Coordinator, Oracle, Point, SafeTransaction},
     config::ValidatorConfig,
     consensus::{
-        epoch::EpochId,
+        epoch::{self, EpochId},
         group::{Group, ParticipantSet},
         hashing::ConsensusDomain,
     },
@@ -23,8 +23,14 @@ use crate::{
     metrics::{self, TransitionKind},
     service::{Action, Effect, Event, Resume},
 };
-use alloy::primitives::{Address, B256, Bytes};
-use safenet_core::state::{Commands, Message, StateTransition};
+use alloy::{
+    primitives::{Address, B256, Bytes},
+    providers::Provider as _,
+};
+use safenet_core::{
+    provider::Provider,
+    state::{Commands, Message, StateInitializer, StateTransition},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -33,7 +39,7 @@ use std::{
 };
 
 /// The complete snapshotted validator state.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct State {
     /// The epoch-rollover / DKG state machine.
     rollover: RolloverState,
@@ -64,10 +70,9 @@ struct Epoch {
 
 /// The epoch-rollover / DKG state machine. Each active variant carries the
 /// group it is generating.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 enum RolloverState {
     /// Idle before the genesis group's DKG has been triggered.
-    #[default]
     WaitingForGenesis,
     /// The rollover has halted in an unrecoverable way.
     ///
@@ -469,6 +474,192 @@ impl StateTransition<State> for Transition {
                 Resume::Nonces { message, nonces } => self.handle_nonces(state, message, nonces),
             },
         }
+    }
+}
+
+/// The validator state initializer.
+///
+/// Reads onchain state to determine whether or not we should start waiting for
+/// genesis or in the middle of an epoch.
+pub struct Initializer {
+    /// The Ethereum RPC provider.
+    pub provider: Provider,
+    /// The consensus address.
+    pub consensus: Address,
+    /// The FROST coordinator address.
+    pub coordinator: Address,
+    /// The configured genesis group ID.
+    pub genesis_group_id: B256,
+    /// The number of blocks per epoch.
+    pub blocks_per_epoch: NonZeroU64,
+    /// The block the indexer back-fills from on a fresh start, if configured.
+    pub start_block: Option<u64>,
+}
+
+/// An error initializing the validator state.
+#[derive(Debug, thiserror::Error)]
+pub enum InitializerError {
+    /// An error reading onchain state.
+    #[error(transparent)]
+    Contract(#[from] alloy::contract::Error),
+    /// The configured genesis group does not match the onchain one.
+    #[error(
+        "configured genesis group {configured} does not match onchain genesis \
+         group {onchain}"
+    )]
+    GenesisGroupMismatch {
+        /// The configured genesis group ID.
+        configured: B256,
+        /// The onchain genesis group ID.
+        onchain: B256,
+    },
+    /// The genesis key generation already started, but its events will not be
+    /// replayed without a configured start block.
+    #[error(
+        "genesis key generation is already underway; configure the index \
+         `start_block` to replay it"
+    )]
+    GenesisInProgress,
+    /// The genesis key generation started before the configured start block,
+    /// so its events will not be replayed.
+    #[error(
+        "genesis key generation started before the index `start_block` \
+         {start_block}; configure an earlier one to replay it"
+    )]
+    GenesisStartedBeforeStartBlock {
+        /// The configured start block.
+        start_block: u64,
+    },
+}
+
+impl Initializer {
+    /// Returns whether the genesis group's key generation has started as of
+    /// `block`.
+    async fn genesis_started(&self, block: u64) -> Result<bool, alloy::contract::Error> {
+        // Use the group parameters as a proxy for whether or not the key
+        // generation has started. The count and threshold are non-zero if and
+        // only if `keyGen(...)` has been called for that group.
+        let parameters = Coordinator::new(self.coordinator, &self.provider)
+            .groupParameters(self.genesis_group_id)
+            .block(block.into())
+            .call()
+            .await?;
+        Ok(parameters.count != 0)
+    }
+
+    /// Checks that the genesis key generation started at or after
+    /// `start_block`, so that its events are replayed by the indexer.
+    ///
+    /// This requires historical state, which the node may not have (for
+    /// example, if it is not an archive node). In that case, the check is
+    /// skipped with a warning.
+    async fn check_can_replay_genesis(&self, start_block: u64) -> Result<(), InitializerError> {
+        let Some(before) = start_block.checked_sub(1) else {
+            return Ok(());
+        };
+        match self.genesis_started(before).await {
+            // The coordinator was not yet deployed, so genesis could not have
+            // started either.
+            Ok(false) | Err(alloy::contract::Error::ZeroData(..)) => Ok(()),
+            Ok(true) => Err(InitializerError::GenesisStartedBeforeStartBlock { start_block }),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    start_block,
+                    "unable to verify that the genesis key generation started after the start block"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns whether the genesis group's key generation has completed as of
+    /// `block`.
+    async fn genesis_completed(&self, block: u64) -> Result<bool, alloy::contract::Error> {
+        // The coordinator only exposes the group key once the group's key
+        // generation is finalized, and reverts otherwise.
+        match Coordinator::new(self.coordinator, &self.provider)
+            .groupKey(self.genesis_group_id)
+            .block(block.into())
+            .call()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err)
+                if err
+                    .as_decoded_error::<Coordinator::GroupNotReady>()
+                    .is_some() =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl StateInitializer<State> for Initializer {
+    type Error = InitializerError;
+
+    async fn initial_state(self) -> Result<State, Self::Error> {
+        let block = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(alloy::contract::Error::from)?;
+        let consensus = Consensus::new(self.consensus, &self.provider);
+
+        let genesis_group_id = consensus
+            .getEpochGroupId(EpochId::Genesis.raw_value())
+            .block(block.into())
+            .call()
+            .await?;
+        if genesis_group_id != self.genesis_group_id {
+            return Err(InitializerError::GenesisGroupMismatch {
+                configured: self.genesis_group_id,
+                onchain: genesis_group_id,
+            });
+        }
+
+        let epochs = consensus
+            .getEpochsState()
+            .block(block.into())
+            .call()
+            .await?;
+        let active_epoch = EpochId::from_raw(epochs.active);
+
+        let rollover = if let Some(next_epoch) = NonZeroU64::new(epochs.staged) {
+            // There is already a staged epoch, wait for it to roll over.
+            RolloverState::EpochStaged { next_epoch }
+        } else if active_epoch == EpochId::Genesis && !self.genesis_completed(block).await? {
+            // Genesis must not be skipped while it has not completed, as it
+            // does not follow the epoch clock: skipping it would start a
+            // rollover key generation that no one else takes part in. If it
+            // already started, its `KeyGen` event is only observed when the
+            // indexer replays it, which requires a start block before it.
+            if self.genesis_started(block).await? {
+                match self.start_block {
+                    Some(start_block) => self.check_can_replay_genesis(start_block).await?,
+                    None => return Err(InitializerError::GenesisInProgress),
+                }
+            }
+            RolloverState::WaitingForGenesis
+        } else {
+            // Skip the epoch whose key generation is already underway
+            // according to the epoch clock. This is not necessarily the epoch
+            // after the active one, as onchain rollovers may lag behind the
+            // epoch clock when key generations fail.
+            RolloverState::EpochSkipped {
+                next_epoch: epoch::next_number(block, self.blocks_per_epoch),
+            }
+        };
+
+        Ok(State {
+            rollover,
+            active_epoch,
+            epochs: BTreeMap::new(),
+            signing: BTreeMap::new(),
+            signature_id_to_message: BTreeMap::new(),
+        })
     }
 }
 

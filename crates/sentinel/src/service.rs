@@ -18,7 +18,7 @@ use alloy::{
 };
 use safenet_core::{
     driver::{ActionEncoder, Service},
-    state::{Command, Commands, Message, StateTransition},
+    state::{Command, Commands, DefaultInitializer, Message, StateTransition},
     tx::{Signer, Transaction},
 };
 use std::time::Duration;
@@ -928,7 +928,7 @@ impl SentinelEncoder {
                 }
                 .abi_encode()
                 .into(),
-                gas: 55_000,
+                gas: 100_000,
             },
             // Measured onchain at ~196k gas for a request's first commit (fresh
             // storage slots for the request, the commitment and the ERC-20
@@ -1070,10 +1070,18 @@ impl Service for SentinelService {
     type Resume = effect::Resume;
 
     type Transition = SentinelTransition;
+    type Initializer = DefaultInitializer;
     type Effects = effect::Handler;
     type Actions = SentinelEncoder;
 
-    fn components(self) -> (Self::Transition, Self::Effects, Self::Actions) {
+    fn components(
+        self,
+    ) -> (
+        Self::Transition,
+        Self::Initializer,
+        Self::Effects,
+        Self::Actions,
+    ) {
         let SentinelService {
             oracle,
             fee_token,
@@ -1093,6 +1101,7 @@ impl Service for SentinelService {
                 chain_id,
                 voting_window,
             },
+            DefaultInitializer,
             effect::Handler::new(engine, engine_timeout, verdicts),
             SentinelEncoder { oracle, fee_token },
         )
