@@ -230,6 +230,7 @@ impl SentinelTransition {
             slash_amount,
             commit_deadline,
             reveal_deadline,
+            committed_count,
         } = request;
         tracing::info!(
             %request_id,
@@ -248,7 +249,7 @@ impl SentinelTransition {
                 slash_amount,
                 commit_deadline,
                 reveal_deadline,
-                committed_count: 0,
+                committed_count,
                 self_committed: false,
             },
         );
@@ -285,6 +286,7 @@ impl SentinelTransition {
             slash_amount: event.slashAmount,
             commit_deadline: event.commitDeadline,
             reveal_deadline: event.revealDeadline,
+            committed_count: 0,
         };
         tracing::info!(
             %request_id,
@@ -340,25 +342,34 @@ impl SentinelTransition {
             );
             return (state, Vec::new());
         };
-        let RequestState::CollectingCommitments {
-            committed_count,
-            self_committed,
-            ..
-        } = entry
-        else {
-            tracing::warn!(
-                request_id = %event.requestId,
-                state = entry.name(),
-                "ignoring unexpected commitment"
-            );
-            return (state, Vec::new());
+        let (committed_count, self_committed) = match entry {
+            RequestState::WaitingForEngineCheck {
+                request: Some(request),
+                ..
+            } => (&mut request.committed_count, None),
+            RequestState::CollectingCommitments {
+                committed_count,
+                self_committed,
+                ..
+            } => (committed_count, Some(self_committed)),
+            entry => {
+                tracing::warn!(
+                    request_id = %event.requestId,
+                    state = entry.name(),
+                    "ignoring unexpected commitment"
+                );
+                return (state, Vec::new());
+            }
         };
         *committed_count += 1;
         // Guarded on the false-to-true edge (rather than just
         // `event.sentinel == self.signer.address()`) so a re-delivered
         // `Committed` log (e.g. replayed after a reorg restores this exact
         // block range) can't double-count our own participation.
-        if !*self_committed && event.sentinel == self.signer.address() {
+        if let Some(self_committed) = self_committed
+            && !*self_committed
+            && event.sentinel == self.signer.address()
+        {
             *self_committed = true;
             crate::metrics::requests_participated_total().increment(1);
             crate::metrics::bond_amount().record(event.bondAmount.to::<u128>() as f64);
@@ -404,6 +415,14 @@ impl SentinelTransition {
         }
         if event.sentinel == self.signer.address() {
             *self_revealed = true;
+        }
+        // Never discard a request based only on a locally complete tally
+        // before our own reveal has been observed. A missed/late commitment
+        // event can make `committed_count` too small; retaining the request
+        // lets our reveal and the oracle's authoritative terminal event drive
+        // the claim path instead of stranding the bond.
+        if !*self_revealed {
+            return (state, Vec::new());
         }
         if *revealed_count < *committed_count {
             return (state, Vec::new());
@@ -1407,6 +1426,7 @@ mod tests {
                     slash_amount: bond_target,
                     commit_deadline: 20,
                     reveal_deadline: 40,
+                    committed_count: 0,
                 }),
             },
         );
@@ -2158,6 +2178,113 @@ mod tests {
         );
     }
 
+    /// Regression for a production race: another sentinel can commit after
+    /// `NewRequest` but before our asynchronous engine check completes. That
+    /// commitment must be carried into the reveal phase; otherwise its first
+    /// reveal looks locally like the last reveal and the request is dropped
+    /// before our reveal and the resulting `OracleResult` can queue a claim.
+    #[test]
+    fn commitment_while_waiting_for_engine_is_counted_and_claimed() {
+        let svc = transition();
+        let safe_tx_hash = B256::repeat_byte(0x13);
+        let id = request_id(safe_tx_hash, 7, ORACLE);
+
+        let (state, _) = svc.apply_transition(
+            State::default(),
+            Message::Event(log(1, proposed_event(ORACLE, safe_tx_hash, TO))),
+        );
+        let (state, _) = svc.apply_transition(
+            state,
+            Message::Event(log(
+                2,
+                new_request_event(
+                    id,
+                    U256::from(1_000u64),
+                    U256::from(500u64),
+                    U256::from(500u64),
+                    20,
+                    40,
+                ),
+            )),
+        );
+
+        // The competing commitment lands while our engine is still running.
+        let (state, commands) = svc.apply_transition(
+            state,
+            Message::Event(log(3, committed_event(id, OTHER, 500))),
+        );
+        assert!(commands.is_empty());
+        assert_eq!(
+            state.0[&id],
+            RequestState::WaitingForEngineCheck {
+                deadline: 1 + VOTING_WINDOW,
+                request: Some(Request {
+                    bond_target: U96::from(500),
+                    slash_amount: U96::from(500),
+                    commit_deadline: 20,
+                    reveal_deadline: 40,
+                    committed_count: 1,
+                }),
+            },
+        );
+
+        let (state, commands) = resolve_engine_check(&svc, state, id, CheckOutcome::Approved);
+        assert_eq!(commands.len(), 2);
+        let (state, _) = svc.apply_transition(
+            state,
+            Message::Event(log(4, committed_event(id, self_address(), 500))),
+        );
+        let (state, _) = svc.apply_transition(state, Message::NewBlock(21));
+
+        // The competing sentinel reveals first. With the lost count this used
+        // to delete the request here because self_revealed was still false.
+        let (state, commands) = svc.apply_transition(
+            state,
+            Message::Event(log(22, revealed_event(id, OTHER, true, 500))),
+        );
+        assert!(commands.is_empty());
+        assert!(matches!(
+            state.0.get(&id),
+            Some(RequestState::CollectingVotes {
+                committed_count: 2,
+                revealed_count: 1,
+                self_revealed: false,
+                ..
+            })
+        ));
+
+        let (state, commands) = svc.apply_transition(
+            state,
+            Message::Event(log(23, revealed_event(id, self_address(), true, 500))),
+        );
+        assert_eq!(
+            commands,
+            vec![
+                SentinelAction {
+                    kind: SentinelActionKind::Finalize { id },
+                    expires_at: None,
+                }
+                .into()
+            ],
+        );
+
+        let (state, commands) = svc.apply_transition(
+            state,
+            Message::Event(log(23, oracle_result_event(id, true))),
+        );
+        assert!(!state.0.contains_key(&id));
+        assert_eq!(
+            commands,
+            vec![
+                SentinelAction {
+                    kind: SentinelActionKind::Claim { id },
+                    expires_at: None,
+                }
+                .into()
+            ],
+        );
+    }
+
     /// An unreachable/malfunctioning engine check must not be guessed at
     /// either way — the request is dropped unanswered instead of voting.
     #[test]
@@ -2236,6 +2363,7 @@ mod tests {
                     slash_amount: U96::from(500),
                     commit_deadline: 20,
                     reveal_deadline: 40,
+                    committed_count: 0,
                 }),
             },
         );

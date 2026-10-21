@@ -17,6 +17,11 @@ pub struct Request {
     pub commit_deadline: u64,
     /// Last block in which a committed vote can be revealed.
     pub reveal_deadline: u64,
+    /// Commitments observed after the request opened but before the engine
+    /// check completed. These must survive the asynchronous check so the
+    /// reveal phase starts from the authoritative event count.
+    #[serde(default)]
+    pub committed_count: u64,
 }
 
 /// Per-request state tracked by the sentinel FSM, mirroring
@@ -338,6 +343,23 @@ mod tests {
     }
 
     #[test]
+    fn request_deserializes_snapshots_from_before_committed_count_was_added() {
+        let request = Request {
+            bond_target: U96::from(500),
+            slash_amount: U96::from(500),
+            commit_deadline: 20,
+            reveal_deadline: 40,
+            committed_count: 0,
+        };
+        let mut legacy = serde_json::to_value(&request).unwrap();
+        legacy.as_object_mut().unwrap().remove("committed_count");
+
+        let restored: Request = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(restored, request);
+    }
+
+    #[test]
     fn state_multiple_requests_in_different_phases() {
         let checking_id = B256::from([1u8; 32]);
         let requested_id = B256::from([2u8; 32]);
@@ -360,6 +382,7 @@ mod tests {
                     slash_amount: U96::from(1_000),
                     commit_deadline: 30,
                     reveal_deadline: 40,
+                    committed_count: 2,
                 }),
             },
         );
